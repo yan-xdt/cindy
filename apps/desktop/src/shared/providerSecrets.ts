@@ -50,8 +50,19 @@ export function providerSecretStorageKey(id: ProviderSecretId): string {
   return STORAGE_KEYS[id];
 }
 
+/**
+ * SSH 远端常驻 codex daemon 经 remote-forward 直连本机 MCP bridge 时使用的
+ * persistent bearer token 的存储键名。
+ *
+ * 与 bridge 主 token (per-run 随机, 经 env 给本地 codex 子进程) 不同:daemon
+ * env 在其 spawn 时固定, 需要跨 app 重启稳定, 因此落 safeStorage。main-only:
+ * renderer 没有正当读取场景, 不经通用 safe-storage IPC 暴露。
+ */
+export const REMOTE_MCP_BRIDGE_TOKEN_STORAGE_KEY = 'remote_mcp_bridge_token';
+
 const MAIN_ONLY_PROVIDER_SECRET_STORAGE_KEYS = new Set<string>([
   STORAGE_KEYS['voice-asr'].toLowerCase(),
+  REMOTE_MCP_BRIDGE_TOKEN_STORAGE_KEY.toLowerCase(),
 ]);
 
 /**

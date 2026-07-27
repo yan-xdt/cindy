@@ -459,9 +459,12 @@ export function NewMakerDraftRoute() {
   const effectiveCollab = collab;
   const collabPolicyEligible =
     effectiveWorkingDir != null &&
-    effectiveRemoteHostId == null &&
     effectiveDeviceLinkDeviceId == null;
-  const collabPolicy = useCollabProjectPolicy(effectiveWorkingDir, collabPolicyEligible);
+  const collabPolicy = useCollabProjectPolicy(effectiveWorkingDir, collabPolicyEligible, {
+    // 远端 draft 的 workingDir 是远端路径, 本机项目插件查询无意义 (main 侧
+    // 对 remote 已放行), 跳过 IPC 直接按 enabled 处理。
+    skipQuery: effectiveRemoteHostId != null,
+  });
   const projectPickerOptions = useProjectPickerOptions();
   const createAgentModeLabel =
     getProjectPickerDisplayName(effectiveWorkingDir, projectPickerOptions) ??
@@ -2460,9 +2463,9 @@ export function NewMakerDraftRoute() {
                         disabled={wtCreating}
                       />
                     }
-                    // 协同 toggle(与对话界面同一控件):仅本地项目 draft 可用 —— 对话模式(无
-                    // workingDir)/ 远程 SSH / device-link 均不支持起 worker(state 层 normalize
-                    // + patchDraft 已强制 collab.enabled=false,这里同口径 gate 渲染)。Lead = 当前
+                    // 协同 toggle(与对话界面同一控件):本地与 SSH 远端项目 draft 均可用
+                    // (远端 worker 创建继承 remoteHostId, 两端 MCP 注入已接通); 对话模式(无
+                    // workingDir)/ device-link 不支持(state 层 normalize + patchDraft 同口径)。Lead = 当前
                     // vendor(上方 VendorSegmentedSwitcher)。onOpenDetails 打开「开启协同」富弹窗
                     // (CreateWorkerPopover:role/agent/model/初始任务),与会话内完全一致;OFF 态点击
                     // 走它而非简单 worker popover。ON 态点击 onChange(enabled:false) 关闭协同。

@@ -75,6 +75,50 @@ describe('codexHttpBridge', () => {
     bridge = null;
   });
 
+  it('accepts an additional bearer token (remote daemon) and rejects unknown tokens', async () => {
+    bridge = await startCodexHttpBridge({
+      serverFactories: { cindy_test: createTestServer },
+      additionalBearerTokens: () => ['remote-persistent-token'],
+      logger: noopLogger(),
+    });
+
+    const initBody = JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'initialize',
+      params: {
+        protocolVersion: '2024-11-05',
+        capabilities: {},
+        clientInfo: { name: 'test-client', version: '1.0.0' },
+      },
+    });
+    const postInit = (token: string) =>
+      fetch(bridge!.url('cindy_test'), {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${token}`,
+          accept: 'application/json, text/event-stream',
+          'content-type': 'application/json',
+        },
+        body: initBody,
+      });
+
+    // 主 token (per-run, 本地 codex 子进程) 可用 — 现状不变。
+    const mainResp = await postInit(bridge.token);
+    expect(mainResp.status).toBe(200);
+    await mainResp.text();
+
+    // additional token (远端常驻 daemon 的 persistent token) 同样放行。
+    const remoteResp = await postInit('remote-persistent-token');
+    expect(remoteResp.status).toBe(200);
+    await remoteResp.text();
+
+    // 未知 token 一律 401 (防呆过滤)。
+    const badResp = await postInit('not-a-real-token');
+    expect(badResp.status).toBe(401);
+    await badResp.text();
+  });
+
   it('routes tool calls by JSON-RPC params._meta.threadId', async () => {
     bridge = await startCodexHttpBridge({
       serverFactories: { cindy_test: createTestServer },
@@ -509,6 +553,243 @@ describe('codexHttpBridge', () => {
       expect(entry.result?.isError).toBe(true);
       expect(entry.result?.content?.[0]?.text).toMatch(/more than one session/);
     }
+  });
+
+  it('resolves identity from ?session= query without _meta.threadId (remote cc)', async () => {
+    bridge = await startCodexHttpBridge({
+      serverFactories: { cindy_test: createTestServer },
+      additionalBearerTokens: () => ['remote-persistent-token'],
+      logger: noopLogger(),
+    });
+    bridge.registerSessionCtx('cc-session-1', {
+      agentKind: 'claude-code',
+      sessionId: 'cc-session-1',
+      workingDir: '/remote/repo',
+      vendorOptions: {},
+    });
+
+    const headers = {
+      authorization: 'Bearer remote-persistent-token',
+      accept: 'application/json, text/event-stream',
+      'content-type': 'application/json',
+    };
+    const sessionUrl = `${bridge.url('cindy_test')}?session=cc-session-1`;
+    const initBody = (id: number) =>
+      JSON.stringify({
+        jsonrpc: '2.0',
+        id,
+        method: 'initialize',
+        params: {
+          protocolVersion: '2024-11-05',
+          capabilities: {},
+          clientInfo: { name: 'test-client', version: '1.0.0' },
+        },
+      });
+    const initResp = await fetch(sessionUrl, {
+      method: 'POST',
+      headers,
+      body: initBody(1),
+    });
+    expect(initResp.status).toBe(200);
+    const mcpSessionId = initResp.headers.get('mcp-session-id');
+    expect(mcpSessionId).toBeTruthy();
+    await initResp.text();
+
+    // tools/call 不带 _meta.threadId —— ?session= query 即身份。
+    const callResp = await fetch(sessionUrl, {
+      method: 'POST',
+      headers: { ...headers, 'mcp-session-id': mcpSessionId ?? '' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'tools/call',
+        params: { name: 'current_session', arguments: {} },
+      }),
+    });
+    expect(callResp.status).toBe(200);
+    expect(await readRpcResponse(callResp)).toMatchObject({
+      result: { content: [{ type: 'text', text: 'cc-session-1' }] },
+    });
+
+    // 注销后 ?session= 未命中立刻 401 (fail-closed)。
+    bridge.unregisterSessionCtx('cc-session-1');
+    const after = await fetch(sessionUrl, {
+      method: 'POST',
+      headers,
+      body: initBody(3),
+    });
+    expect(after.status).toBe(401);
+    await after.text();
+  });
+
+  it('rejects an unregistered ?session= query while leaving token-only requests untouched', async () => {
+    bridge = await startCodexHttpBridge({
+      serverFactories: { cindy_test: createTestServer },
+      additionalBearerTokens: () => ['remote-persistent-token'],
+      logger: noopLogger(),
+    });
+    const initBody = JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'initialize',
+      params: {
+        protocolVersion: '2024-11-05',
+        capabilities: {},
+        clientInfo: { name: 'test-client', version: '1.0.0' },
+      },
+    });
+    const headers = {
+      accept: 'application/json, text/event-stream',
+      'content-type': 'application/json',
+    };
+
+    // 声称了 session 但未注册 → 401 fail-closed (sessionId 是明文路由参数)。
+    const forged = await fetch(`${bridge.url('cindy_test')}?session=nobody`, {
+      method: 'POST',
+      headers: { ...headers, authorization: 'Bearer remote-persistent-token' },
+      body: initBody,
+    });
+    expect(forged.status).toBe(401);
+    await forged.text();
+
+    // 不带 ?session= 的请求不受影响 (本地 codex 子进程的主 token 路径)。
+    const plain = await fetch(bridge.url('cindy_test'), {
+      method: 'POST',
+      headers: { ...headers, authorization: `Bearer ${bridge.token}` },
+      body: initBody,
+    });
+    expect(plain.status).toBe(200);
+    await plain.text();
+  });
+
+  it('applies the frozen plugin policy to ?session= ctx tool calls (remote cc)', async () => {
+    bridge = await startCodexHttpBridge({
+      serverFactories: { cindy_test: createTestServer },
+      pluginIdByServerName: { cindy_test: 'ssh' },
+      additionalBearerTokens: () => ['remote-persistent-token'],
+      logger: noopLogger(),
+    });
+    // cc 远端不带 _meta.threadId,policy 边界必须从 ?session= ctx 取,
+    // 否则禁用插件的 tools/call 会被 missing_thread_context 以外的路径漏过。
+    bridge.registerSessionCtx('cc-disabled', {
+      agentKind: 'claude-code',
+      sessionId: 'cc-disabled',
+      workingDir: '/remote/repo',
+      vendorOptions: {
+        [CODEX_DISABLED_BUILTIN_PLUGIN_IDS_KEY]: ['ssh'],
+      },
+    });
+
+    const headers = {
+      authorization: 'Bearer remote-persistent-token',
+      accept: 'application/json, text/event-stream',
+      'content-type': 'application/json',
+    };
+    const sessionUrl = `${bridge.url('cindy_test')}?session=cc-disabled`;
+    const initResp = await fetch(sessionUrl, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'initialize',
+        params: {
+          protocolVersion: '2024-11-05',
+          capabilities: {},
+          clientInfo: { name: 'test-client', version: '1.0.0' },
+        },
+      }),
+    });
+    const mcpSessionId = initResp.headers.get('mcp-session-id');
+    expect(mcpSessionId).toBeTruthy();
+    await initResp.text();
+
+    const callResp = await fetch(sessionUrl, {
+      method: 'POST',
+      headers: { ...headers, 'mcp-session-id': mcpSessionId ?? '' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'tools/call',
+        params: { name: 'current_session', arguments: {} },
+      }),
+    });
+    expect(callResp.status).toBe(200);
+    expect(await readRpcResponse(callResp)).toMatchObject({
+      result: { isError: true },
+    });
+  });
+
+  it('ignores a forged _meta.threadId on ?session= requests for the policy check', async () => {
+    // sec P1 回归:?session= 路由下请求体携带一个已注册且未禁用 plugin 的
+    // threadId 时, policy 判定不得按那个 thread ctx 放行 —— 执行态身份与
+    // policy ctx 都必须是 ?session= 强优先。
+    bridge = await startCodexHttpBridge({
+      serverFactories: { cindy_test: createTestServer },
+      pluginIdByServerName: { cindy_test: 'ssh' },
+      additionalBearerTokens: () => ['remote-persistent-token'],
+      logger: noopLogger(),
+    });
+    // 伪造目标:一个已注册、未禁用 ssh plugin 的 codex thread。
+    bridge.registerThreadContext('thread-clean', {
+      agentKind: 'codex',
+      sessionId: 'session-clean',
+      workingDir: '/repo',
+      vendorOptions: {},
+    });
+    bridge.registerSessionCtx('cc-disabled', {
+      agentKind: 'claude-code',
+      sessionId: 'cc-disabled',
+      workingDir: '/remote/repo',
+      vendorOptions: {
+        [CODEX_DISABLED_BUILTIN_PLUGIN_IDS_KEY]: ['ssh'],
+      },
+    });
+
+    const headers = {
+      authorization: 'Bearer remote-persistent-token',
+      accept: 'application/json, text/event-stream',
+      'content-type': 'application/json',
+    };
+    const sessionUrl = `${bridge.url('cindy_test')}?session=cc-disabled`;
+    const initResp = await fetch(sessionUrl, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'initialize',
+        params: {
+          protocolVersion: '2024-11-05',
+          capabilities: {},
+          clientInfo: { name: 'test-client', version: '1.0.0' },
+        },
+      }),
+    });
+    const mcpSessionId = initResp.headers.get('mcp-session-id');
+    expect(mcpSessionId).toBeTruthy();
+    await initResp.text();
+
+    const callResp = await fetch(sessionUrl, {
+      method: 'POST',
+      headers: { ...headers, 'mcp-session-id': mcpSessionId ?? '' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'tools/call',
+        params: {
+          name: 'current_session',
+          arguments: {},
+          // 伪造: 已注册且未禁用 ssh 的 threadId。
+          _meta: { threadId: 'thread-clean' },
+        },
+      }),
+    });
+    expect(callResp.status).toBe(200);
+    // 仍按 ?session= 的 disabled policy 拦截, 不被伪造 threadId 放行。
+    expect(await readRpcResponse(callResp)).toMatchObject({
+      result: { isError: true },
+    });
   });
 
   it('blocks a tool call using the policy frozen on its Codex thread', async () => {

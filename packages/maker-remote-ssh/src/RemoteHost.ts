@@ -16,7 +16,15 @@
  */
 
 import { EventEmitter } from 'node:events';
-import { Client, type ConnectConfig, type ClientChannel } from 'ssh2';
+import net from 'node:net';
+import {
+  Client,
+  type AcceptConnection,
+  type ClientChannel,
+  type ConnectConfig,
+  type RejectConnection,
+  type TcpConnectionDetails,
+} from 'ssh2';
 
 import type { HostConfig, HostSnapshot, RemoteStatus } from './types.js';
 import { resolveAuth } from './credentials.js';
@@ -104,6 +112,37 @@ export interface ExecStreamHandle {
    */
   kill(signal?: string): void;
 }
+
+/**
+ * 一条 remote→local 端口转发的注册参数 (`ssh -R` 语义):sshd 在远端
+ * 127.0.0.1:<remotePort> 监听,连入的连接经本 SSH 连接 pipe 回本机
+ * localHost:localPort。
+ *
+ * remotePort 由调用方指定 (desktop 层按 per-host 固定端口策略分配,保证远端
+ * daemon 配置文件里的 url 跨 app 重启 / SSH 重连稳定);本层不做候选端口
+ * 搜索 —— 端口被占时 forwardIn 报错,由调用方换端口重试。
+ */
+export interface RemoteForwardSpec {
+  /** 调用方标识 (如 'codex-mcp-bridge');同 id 重复注册幂等。 */
+  id: string;
+  /** sshd 在远端 127.0.0.1 上监听的端口。 */
+  remotePort: number;
+  /** 本机转发目标。 */
+  localHost: string;
+  localPort: number;
+}
+
+export interface RemoteForwardInfo extends RemoteForwardSpec {
+  /**
+   * 当前 SSH client 上是否已实际绑定 (sshd 真在监听)。重连 rebind 失败的
+   * 项保留但 bound=false,后续同参 openRemoteForward 必须重新 bind,而不
+   * 是幂等短路返回一个远端并没有监听的"假成功"。
+   */
+  bound: boolean;
+}
+
+/** @deprecated 历史别名;直接用 RemoteForwardInfo。 */
+type ForwardEntry = RemoteForwardInfo;
 
 /**
  * Heuristic — does this ssh2 error message indicate an auth failure
@@ -226,6 +265,12 @@ export class RemoteHost {
    * Reset at the start of every connect attempt.
    */
   private hostKeyError: string | null = null;
+  /**
+   * 已注册的 remote→local 端口转发意图。连接断开期间保留,重连成功后按
+   * 同端口重建 —— 转发注册表达的是"这个 host 需要这条转发"的持续意图,
+   * 不随单次连接生命周期清空。
+   */
+  private forwards = new Map<string, ForwardEntry>();
 
   constructor(config: HostConfig, deps: RemoteHostDeps) {
     this.id = config.id;
@@ -434,6 +479,81 @@ export class RemoteHost {
     });
   }
 
+  // ── remote port forwarding (`ssh -R`) ────────────────────────────────────
+
+  /**
+   * 注册一条 remote→local 端口转发。同 id 重复调用幂等:参数完全一致且
+   * 当前连接上已实际绑定,直接返回既有记录;参数变化视为替换 (先拆后建);
+   * 参数一致但转发处于 rebind 失败留下的未绑定态时,重新执行 bind。
+   * 转发意图跨连接保留,重连成功后自动按同端口重建 (见 doConnect 的 onReady)。
+   */
+  async openRemoteForward(spec: RemoteForwardSpec): Promise<RemoteForwardInfo> {
+    const existing = this.forwards.get(spec.id);
+    if (existing) {
+      const sameTarget =
+        existing.remotePort === spec.remotePort &&
+        existing.localHost === spec.localHost &&
+        existing.localPort === spec.localPort;
+      if (sameTarget && existing.bound) {
+        return {
+          id: existing.id,
+          remotePort: existing.remotePort,
+          localHost: existing.localHost,
+          localPort: existing.localPort,
+          bound: existing.bound,
+        };
+      }
+      if (!sameTarget) {
+        await this.closeRemoteForward(spec.id);
+      }
+      // sameTarget && !existing.bound:rebind 失败留下的 intent,继续走重 bind。
+    }
+    const client = this.requireReady();
+    await this.bindForward(client, spec);
+    // 代际校验:bind 期间连接可能已断开并被新 client 替换(自动重连已完成
+    // rebindForwards,但那时本 intent 尚未入表)。旧 client 迟到的成功回调
+    // 不能写成 bound=true —— 旧连接上的绑定随连接死亡已消失,新连接上
+    // 并没有监听。按失败抛出,调用方下次 ensure 会在新连接上重 bind。
+    if (this.client !== client) {
+      throw new Error(`connection replaced during forward bind for "${spec.id}" — retry on the new connection`);
+    }
+    this.forwards.set(spec.id, { ...spec, bound: true });
+    this.log.info('ssh remote forward opened', {
+      host: this.id,
+      forward: spec.id,
+      remotePort: spec.remotePort,
+      local: `${spec.localHost}:${spec.localPort}`,
+    });
+    return { ...spec, bound: true };
+  }
+
+  /**
+   * 拆除一条转发。幂等;连接不在 ready 时只清意图表 (sshd 侧的监听已随
+   * 连接消失,无需 unforward)。
+   */
+  async closeRemoteForward(id: string): Promise<void> {
+    const fwd = this.forwards.get(id);
+    if (!fwd) return;
+    this.forwards.delete(id);
+    if (this.status !== 'ready' || !this.client) return;
+    await new Promise<void>((resolve) => {
+      try {
+        this.client!.unforwardIn('127.0.0.1', fwd.remotePort, () => resolve());
+      } catch {
+        resolve();
+      }
+    });
+    this.log.info('ssh remote forward closed', {
+      host: this.id,
+      forward: id,
+      remotePort: fwd.remotePort,
+    });
+  }
+
+  listRemoteForwards(): RemoteForwardInfo[] {
+    return Array.from(this.forwards.values());
+  }
+
   // ── internals ────────────────────────────────────────────────────────────
 
   /** Guard for channel ops. */
@@ -442,6 +562,93 @@ export class RemoteHost {
       throw new Error(`remote host "${this.id}" is not ready (status=${this.status})`);
     }
     return this.client;
+  }
+
+  private bindForward(client: Client, spec: RemoteForwardSpec): Promise<void> {
+    return new Promise((resolve, reject) => {
+      client.forwardIn('127.0.0.1', spec.remotePort, (err) => {
+        if (err) {
+          reject(new Error(`remote port ${spec.remotePort} unavailable: ${err.message}`));
+          return;
+        }
+        resolve();
+      });
+    });
+  }
+
+  /**
+   * 重连成功后重建全部转发意图。个别失败不阻塞连接 ready 与其他转发;
+   * 失败项保留在表里并标为未绑定,下次重连或同参 openRemoteForward 再试。
+   */
+  private async rebindForwards(client: Client): Promise<void> {
+    for (const fwd of this.forwards.values()) {
+      // 新 client 上一切转发都尚未绑定,先落状态再逐项 bind。
+      fwd.bound = false;
+      try {
+        await this.bindForward(client, fwd);
+        // 旧 client 迟到的成功回调不得污染 intent:连接已换代时本 bind 属于
+        // 已废弃连接, bound 留给新一代的 rebind / 同参 openRemoteForward 决定
+        // (否则当前 client 其实没监听, 同参 open 却会短路返回假成功)。
+        if (this.client !== client) {
+          continue;
+        }
+        fwd.bound = true;
+        this.log.info('ssh remote forward rebound', {
+          host: this.id,
+          forward: fwd.id,
+          remotePort: fwd.remotePort,
+        });
+      } catch (err) {
+        this.log.error('ssh remote forward rebind failed', {
+          host: this.id,
+          forward: fwd.id,
+          remotePort: fwd.remotePort,
+          error: (err as Error).message,
+        });
+      }
+    }
+  }
+
+  /**
+   * sshd 侧有连入时按 destPort 分发到已注册转发,把 ssh channel 与本机
+   * localHost:localPort 双向 pipe。未知端口一律 reject —— 只放行显式
+   * 注册过的转发,不变成开放式代理。
+   */
+  private handleForwardedTcpConnection(
+    details: TcpConnectionDetails,
+    accept: AcceptConnection<ClientChannel>,
+    reject: RejectConnection,
+  ): void {
+    let target: RemoteForwardInfo | undefined;
+    for (const fwd of this.forwards.values()) {
+      if (fwd.remotePort === details.destPort) {
+        target = fwd;
+        break;
+      }
+    }
+    if (!target) {
+      this.log.warn('ssh rejected forwarded connection: unregistered port', {
+        host: this.id,
+        destPort: details.destPort,
+        src: `${details.srcIP}:${details.srcPort}`,
+      });
+      reject();
+      return;
+    }
+    const channel = accept();
+    const local = net.connect(target.localPort, target.localHost);
+    // 任一方向出错/关闭都要拆掉另一方,避免半开连接让 main 进程长期持有
+    // 空转 socket。pipe 自身只传播 end 不传播 error/close。
+    channel.on('error', () => local.destroy());
+    channel.on('close', () => local.destroy());
+    local.on('error', () => {
+      try { channel.close(); } catch { /* already gone */ }
+    });
+    local.on('close', () => {
+      try { channel.close(); } catch { /* already gone */ }
+    });
+    channel.pipe(local);
+    local.pipe(channel);
   }
 
   /**
@@ -563,9 +770,25 @@ export class RemoteHost {
         this.lastError = undefined;
         this.lastAuthLabel = auth.label;
         this.reconnectAttempts = 0;
-        this.setStatus('ready');
-        this.log.info('ssh ready', { id: this.id, auth: auth.label });
-        resolve();
+        // 转发意图随连接生命周期:重连后在 ready 前尽力重建,保证
+        // "host ready ⇒ 已尝试恢复全部转发"。个别失败不阻塞连接本身
+        // (rebindForwards 内部已逐项 catch)。
+        void this.rebindForwards(client)
+          .catch(() => undefined)
+          .then(() => {
+            // rebind 是异步的:期间连接可能已断开 (onClose → handlePostReadyClose
+            // 已把 client 置空并进入 reconnecting/disconnected) 或被用户
+            // disconnect,也可能被新一轮 doConnect 替换。只有 client 仍是本次
+            // 连接时才发布 ready——否则把本次 connect 按失败收尾,状态以
+            // close 流程已经设置的为准,绝不覆盖成 "ready 但 client 为空"。
+            if (this.client !== client) {
+              reject(new Error(this.lastError ?? 'connection closed during forward rebind'));
+              return;
+            }
+            this.setStatus('ready');
+            this.log.info('ssh ready', { id: this.id, auth: auth.label });
+            resolve();
+          });
       };
 
       const onError = (err: Error) => {
@@ -617,6 +840,11 @@ export class RemoteHost {
       client.on('ready', onReady);
       client.on('error', onError);
       client.on('close', onClose);
+      // remote→local 转发的连入分发 (sshd 接受远端 127.0.0.1:<port> 连接后
+      // 经本事件推回)。listener 挂在每个新 client 上,重连后随 client 重建。
+      client.on('tcp connection', (details, accept, reject) => {
+        this.handleForwardedTcpConnection(details, accept, reject);
+      });
 
       try {
         client.connect(connectConfig);

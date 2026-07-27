@@ -67,6 +67,7 @@ import {
   dismissPendingCcMgrUpgrade,
   ensureCcManagerInstalledOrInstall,
 } from './cc-manager-install.js';
+import { removeRemoteMcpForwardPref } from './codex-remote-mcp.js';
 import { ensureDaemonRunning } from '../maker-host/cc-manager-client.js';
 import { softCloseCcSessionsForHost } from '../maker-host/index.js';
 
@@ -608,8 +609,10 @@ export function registerRemoteSshIpc(): void {
 
     await getPool().remove(id);
     // 同步清掉 prefs 里的孤儿 autoConnect 标志, 避免后续重新 add 同名 host 时
-    // 拿到旧偏好造成"莫名其妙又自动连了"。同步清 agent install cache。
+    // 拿到旧偏好造成"莫名其妙又自动连了"。同步清 agent install cache 与
+    // per-host MCP 转发端口记录。
     removeSshHostPref(id);
+    removeRemoteMcpForwardPref(id);
     remoteAgentInstalledCache.delete(id);
     clearCcManagerInstallCache(id);
     return { ok: true as const };

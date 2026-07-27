@@ -187,10 +187,11 @@ export const sessions = sqliteTable(
     extraDirs: text('extra_dirs').notNull().default('[]'),
     /**
      * 远端目标 host id (`@cindy/maker-remote-ssh` ConnectionPool 里的 alias)。
-     * 非空 = 这个 session 跑在远端机器上 (codex agent 在远端、workingDir 是远端路径)。
+     * 非空 = 这个 session 跑在远端机器上 (agent 在远端、workingDir 是远端路径)。
      * 应用重启 / session 切换都能恢复远端目标; 本地 session 字段为 null,
      * 跟历史行为兼容 (老 session 没这列, sqlite default null 即可)。
-     * 仅 Codex 支持; Claude session 此列恒为 null (capability 未接通)。
+     * Codex 与 Claude Code 均支持 (cc 经 cc-mgr daemon, codex 经 app-server
+     * daemon);两端 in-process MCP 都经 SSH remote-forward 回本机 HTTP bridge。
      */
     remoteHostId: text('remote_host_id'),
     /**

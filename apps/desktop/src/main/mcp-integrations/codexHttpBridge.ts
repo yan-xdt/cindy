@@ -46,6 +46,22 @@ export interface CodexHttpBridge {
   url(serverName: string): string;
   registerThreadContext(threadId: string, ctx: LiziMcpSessionContext): void;
   unregisterThreadContext(threadId: string): void;
+  /**
+   * sessionId → session ctx 直绑通道 (远端 Claude Code 用)。
+   * cc 远端经 SSH remote-forward 直连本 bridge,但其 MCP 请求的 _meta 里没有
+   * codex 那样的 threadId —— 改为持久 bearer token (additionalBearerTokens)
+   * 鉴权 + URL query `?session=<sessionId>` 路由:query 命中注册表即以此 ctx
+   * 执行,不依赖请求体路由。persistent token 跨 app 重启稳定,远端 daemon
+   * env 固定也能用;ctx 随 query 生命周期注册/注销,不落盘。
+   */
+  registerSessionCtx(sessionId: string, ctx: LiziMcpSessionContext): void;
+  /**
+   * session 结束/重建时注销;对未注册的 id 幂等。
+   * expectedCtx 传入时做代际比较:Map 当前值已不是本次注册对象 (同
+   * session 重建覆盖了新 ctx) 则不动 — 旧 query 的迟到 cleanup 不得
+   * 误删新 query 刚注册的 ctx。
+   */
+  unregisterSessionCtx(sessionId: string, expectedCtx?: LiziMcpSessionContext): void;
   shutdown(): Promise<void>;
 }
 
@@ -58,6 +74,14 @@ export interface StartCodexHttpBridgeOptions {
   serverFactories: Record<string, () => McpServer>;
   /** Built-in plugin id for each policy-controlled MCP server. */
   pluginIdByServerName?: Record<string, string>;
+  /**
+   * 除主 token (per-run 随机, 经 LIZI_MCP_TOKEN env 给本地 codex 子进程) 之外
+   * 额外接受的 bearer token。用于远端常驻 codex daemon 经 SSH remote-forward
+   * 直连本 bridge 的场景:daemon env 在 spawn 时固定,需要跨 app 重启稳定的
+   * persistent token,不能跟 per-run 主 token 一起轮换。
+   * 函数形式读取:token 允许晚于 bridge 启动才生成/落盘。
+   */
+  additionalBearerTokens?: () => readonly string[];
   logger: Logger;
 }
 
@@ -80,6 +104,8 @@ export async function startCodexHttpBridge(
     transportsByServer.set(name, new Map());
   }
   const threadContextStore = createCodexMcpThreadContextStore();
+  // sessionId → ctx (远端 cc 的身份通道, 经 ?session= query 路由, 见 interface 注释)。
+  const sessionCtxById = new Map<string, LiziMcpSessionContext>();
 
   const httpServer = http.createServer(async (req, res) => {
     res.setHeader('Server', SERVER_HEADER);
@@ -95,9 +121,16 @@ export async function startCodexHttpBridge(
         return;
       }
 
-      // bearer token 鉴权
+      // bearer token 鉴权:主 token (per-run, 本地 codex 子进程) / 额外 token
+      // (persistent, 远端常驻 codex daemon 与远端 cc 共用)。
       const auth = req.headers['authorization'];
-      if (typeof auth !== 'string' || !auth.startsWith('Bearer ') || auth.slice(7) !== token) {
+      const presented =
+        typeof auth === 'string' && auth.startsWith('Bearer ') ? auth.slice(7) : null;
+      const accepted =
+        presented !== null &&
+        (presented === token ||
+          (opts.additionalBearerTokens?.().includes(presented) ?? false));
+      if (!accepted) {
         res.statusCode = 401;
         res.setHeader('WWW-Authenticate', 'Bearer');
         res.end();
@@ -107,6 +140,21 @@ export async function startCodexHttpBridge(
 
       // 路由 /mcp/<name>
       const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+      // 远端 cc 身份路由:?session=<id> 命中注册表即取该 ctx (见 interface
+      // 注释)。声称了 session 但未注册 → 401 fail-closed:sessionId 是明文
+      // 路由参数,未命中说明 query 已注销或id 系伪造,不能按无 ctx 放行。
+      // 不带 ?session= 的 (本地 codex 子进程) 走请求体 threadId 路由。
+      const sessionQuery = url.searchParams.get('session');
+      let sessionTokenCtx: LiziMcpSessionContext | undefined;
+      if (sessionQuery !== null) {
+        sessionTokenCtx = sessionCtxById.get(sessionQuery);
+        if (!sessionTokenCtx) {
+          res.statusCode = 401;
+          res.end();
+          log.warn('rejected request with unregistered session query', { url: req.url });
+          return;
+        }
+      }
       if (!url.pathname.startsWith(MCP_PATH_PREFIX)) {
         res.statusCode = 404;
         res.end();
@@ -136,6 +184,7 @@ export async function startCodexHttpBridge(
         log,
         threadContextStore,
         pluginId: opts.pluginIdByServerName?.[serverName],
+        sessionTokenCtx,
       });
     } catch (err) {
       log.error('request handler threw', {
@@ -245,6 +294,15 @@ export async function startCodexHttpBridge(
     url: (serverName) => `http://127.0.0.1:${port}${MCP_PATH_PREFIX}${encodeURIComponent(serverName)}`,
     registerThreadContext: threadContextStore.registerThreadContext,
     unregisterThreadContext: threadContextStore.unregisterThreadContext,
+    registerSessionCtx: (sessionId, ctx) => {
+      sessionCtxById.set(sessionId, ctx);
+    },
+    unregisterSessionCtx: (sessionId, expectedCtx) => {
+      if (expectedCtx !== undefined && sessionCtxById.get(sessionId) !== expectedCtx) {
+        return;
+      }
+      sessionCtxById.delete(sessionId);
+    },
     shutdown,
   };
 }
@@ -288,6 +346,8 @@ interface DispatchOpts {
   log: Logger;
   threadContextStore: ReturnType<typeof createCodexMcpThreadContextStore>;
   pluginId?: string;
+  /** per-session token 命中时解析出的 ctx;存在即优先于 _meta.threadId 路由。 */
+  sessionTokenCtx?: LiziMcpSessionContext;
 }
 
 interface SessionTransport {
@@ -305,7 +365,7 @@ interface SessionTransport {
  * 重新 init MCP server 的开销)。
  */
 async function dispatchToTransport(opts: DispatchOpts): Promise<void> {
-  const { req, res, createMcpServer, transports, serverName, log, threadContextStore, pluginId } = opts;
+  const { req, res, createMcpServer, transports, serverName, log, threadContextStore, pluginId, sessionTokenCtx } = opts;
 
   const sessionIdHeader = req.headers['mcp-session-id'];
   const sessionId = typeof sessionIdHeader === 'string' ? sessionIdHeader : undefined;
@@ -318,7 +378,8 @@ async function dispatchToTransport(opts: DispatchOpts): Promise<void> {
       return;
     }
     let parsedBody: unknown;
-    let activeContext: LiziMcpSessionContext | undefined;
+    // per-session token (远端 cc) 命中即身份,优先于 _meta.threadId (codex) 路由。
+    let activeContext: LiziMcpSessionContext | undefined = sessionTokenCtx;
     if (req.method === 'POST') {
       try {
         parsedBody = await readJsonBody(req);
@@ -332,26 +393,30 @@ async function dispatchToTransport(opts: DispatchOpts): Promise<void> {
         res.end('Invalid request body');
         return;
       }
-      const threadId = extractCodexThreadId(parsedBody);
-      activeContext = threadContextStore.getContextForThreadId(threadId);
-      let decision: 'no_thread_id' | 'thread_unregistered' | 'ctx_resolved';
-      if (!threadId) {
-        decision = 'no_thread_id';
-      } else if (activeContext) {
-        decision = 'ctx_resolved';
-      } else {
-        decision = 'thread_unregistered';
+      if (!activeContext) {
+        const threadId = extractCodexThreadId(parsedBody);
+        activeContext = threadContextStore.getContextForThreadId(threadId);
+        let decision: 'no_thread_id' | 'thread_unregistered' | 'ctx_resolved';
+        if (!threadId) {
+          decision = 'no_thread_id';
+        } else if (activeContext) {
+          decision = 'ctx_resolved';
+        } else {
+          decision = 'thread_unregistered';
+        }
+        log.debug('codex MCP thread context route decision', {
+          serverName,
+          mcpSessionId: prefixId(sessionId),
+          threadId: prefixId(threadId),
+          decision,
+          registeredThreadCount: threadContextStore.registeredThreadCount(),
+        });
       }
-      log.debug('codex MCP thread context route decision', {
-        serverName,
-        mcpSessionId: prefixId(sessionId),
-        threadId: prefixId(threadId),
-        decision,
-        registeredThreadCount: threadContextStore.registeredThreadCount(),
-      });
     }
+    // per-session token (远端 cc) 命中时身份来自 URL token,tools/call 的
+    // policy 边界同样要用这份 ctx,不能回落到 threadId 路由后判 missing。
     const blockedToolCall = pluginId
-      ? findBlockedToolCall(parsedBody, threadContextStore, pluginId)
+      ? findBlockedToolCall(parsedBody, threadContextStore, pluginId, sessionTokenCtx)
       : undefined;
     if (blockedToolCall && pluginId) {
       log.info('blocked Codex built-in tool call', {
@@ -467,9 +532,12 @@ function findBlockedToolCall(
   body: unknown,
   threadContextStore: ReturnType<typeof createCodexMcpThreadContextStore>,
   pluginId: string,
+  sessionTokenCtx?: LiziMcpSessionContext,
 ): BlockedToolCall | undefined {
   const messages = Array.isArray(body) ? body : [body];
-  if (hasAmbiguousThreadContext(messages)) {
+  // ?session= 路由时 threadId 不参与任何判定 (强优先, 见下), ambiguity
+  // 检查同样豁免 — 否则伪造/串台的 batch threadId 反而有语义效力。
+  if (!sessionTokenCtx && hasAmbiguousThreadContext(messages)) {
     return { reason: 'ambiguous_thread_context' };
   }
   for (const message of messages) {
@@ -477,8 +545,12 @@ function findBlockedToolCall(
     // Resolve each tools/call independently. Batch siblings such as MCP
     // notifications may legitimately omit threadId and must not make a
     // disabled call fail open.
+    // ?session= 路由 (sessionTokenCtx 非空) 时身份已由 URL query 绑定且
+    // fail-closed, 请求体的 _meta.threadId 不得覆盖 policy ctx —— 否则伪造
+    // 一个已注册 threadId 就能绕过本 session 冻结的 built-in plugin
+    // disabled policy (执行态身份同样是 sessionTokenCtx 强优先)。
     const threadId = extractCodexThreadIdFromMessage(message);
-    const context = threadContextStore.getContextForThreadId(threadId);
+    const context = sessionTokenCtx ?? threadContextStore.getContextForThreadId(threadId);
     // Ordinary built-in providers are initialized globally, so the bridge is
     // their only deterministic per-thread policy boundary. A malformed or
     // stale client must not bypass that boundary by omitting an id or naming

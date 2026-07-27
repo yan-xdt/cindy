@@ -64,6 +64,7 @@ function createDeps(overrides: Partial<OrcaWorkerCreationDeps> = {}) {
       permissionMode: 'default',
       fastMode: false,
       providerId: 'xd',
+      remoteHostId: null,
     })),
     getWorkerDefaults: vi.fn(() => ({})),
     getAvailableModels: vi.fn((agent: AgentKind) => (
@@ -260,6 +261,56 @@ describe('OrcaWorkerCreationService', () => {
     expect(deps.bootstrapSession).toHaveBeenCalledTimes(1);
     expect(deps.addOrUpdateWorker).toHaveBeenCalledTimes(1);
     expect(deps.markOrcaRoleIfNeeded).toHaveBeenCalledTimes(1);
+  });
+
+  it('runs the remote ensure before bootstrap for a remote lead, and skips it for a local lead', async () => {
+    // codex-1/orca-2 回归:remote lead 的 worker 继承 remoteHostId, 创建前必须
+    // 走 SSH 重连 / agent 安装 / codex daemon MCP 注入的 ensure, 否则远端
+    // 协同 MCP 通道不就绪。
+    const order: string[] = [];
+    const ensureRemoteReadyForSessionStart = vi.fn(async () => {
+      order.push('ensure');
+    });
+    const remoteLeadRow = {
+      id: 'lead-1',
+      agentKind: 'codex' as const,
+      workingDir: '/srv/repo',
+      model: 'gpt-5.5',
+      effort: 'medium',
+      permissionMode: 'default',
+      fastMode: false,
+      providerId: 'xd',
+      remoteHostId: 'host-remote-1',
+    };
+    const { deps, service } = createDeps({
+      getLeadSessionRow: vi.fn(async () => remoteLeadRow),
+      ensureRemoteReadyForSessionStart,
+      bootstrapSession: vi.fn(async (opts: MakerSessionCreateOpts) => {
+        order.push('bootstrap');
+        return {
+          session: { id: opts.id ?? WORKER_SESSION_ID, agentKind: opts.agentKind },
+          didInjectOrcaInstructions: true,
+          didInjectProjectContext: false,
+        };
+      }),
+    });
+
+    await expect(
+      service.createWorker({ leadSessionId: 'lead-1', role: 'reviewer', agent: 'codex', label: 'reviewer' }),
+    ).resolves.toMatchObject({ ok: true });
+
+    expect(ensureRemoteReadyForSessionStart).toHaveBeenCalledTimes(1);
+    expect(ensureRemoteReadyForSessionStart).toHaveBeenCalledWith({
+      createOpts: expect.objectContaining({ remoteHostId: 'host-remote-1' }),
+    });
+    expect(order.slice(0, 2)).toEqual(['ensure', 'bootstrap']);
+
+    // 本地 lead: 不调 ensure。
+    const local = createDeps();
+    await expect(
+      local.service.createWorker({ leadSessionId: 'lead-1', role: 'reviewer', agent: 'codex', label: 'reviewer' }),
+    ).resolves.toMatchObject({ ok: true });
+    expect(local.deps.ensureRemoteReadyForSessionStart).toBeUndefined();
   });
 
   it('counts terminal workers toward the hard limit before any creation side effects', async () => {
@@ -543,6 +594,53 @@ describe('OrcaWorkerCreationService', () => {
     }));
   });
 
+  it('inherits remoteHostId from a remote lead into the worker create opts', async () => {
+    const { deps, service } = createDeps({
+      getLeadSessionRow: vi.fn(async () => ({
+        id: 'lead-1',
+        agentKind: 'codex' as const,
+        workingDir: '/srv/repo',
+        model: 'gpt-5.5',
+        effort: 'medium',
+        permissionMode: 'default',
+        fastMode: false,
+        providerId: 'xd',
+        remoteHostId: 'remote-host-1',
+      })),
+    });
+
+    await expect(
+      service.createWorker({
+        leadSessionId: 'lead-1',
+        role: 'reviewer',
+        agent: 'codex',
+        label: 'reviewer',
+      }),
+    ).resolves.toMatchObject({ ok: true });
+
+    // remote lead 的 worker 必须在同一台远端主机 spawn,继承远端 workingDir。
+    expect(deps.buildCreateOptsWithStderr).toHaveBeenCalledWith(expect.objectContaining({
+      workingDir: '/srv/repo',
+      remoteHostId: 'remote-host-1',
+    }));
+  });
+
+  it('omits remoteHostId in worker create opts for a local lead', async () => {
+    const { deps, service } = createDeps();
+
+    await expect(
+      service.createWorker({
+        leadSessionId: 'lead-1',
+        role: 'reviewer',
+        agent: 'codex',
+        label: 'reviewer',
+      }),
+    ).resolves.toMatchObject({ ok: true });
+
+    const arg = (deps.buildCreateOptsWithStderr as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as Record<string, unknown>;
+    expect('remoteHostId' in arg).toBe(false);
+  });
+
   it('normalizes inherited minimal effort from the lead session to low for a Codex GPT worker', async () => {
     const { deps, service } = createDeps({
       getLeadSessionRow: vi.fn(async () => ({
@@ -554,6 +652,7 @@ describe('OrcaWorkerCreationService', () => {
         permissionMode: 'default',
         fastMode: false,
         providerId: 'xd',
+        remoteHostId: null,
       })),
     });
 

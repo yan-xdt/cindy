@@ -34,13 +34,19 @@ type ProjectRefreshTracker = {
 /**
  * Reads the effective project-scoped collab plugin state for renderer gating.
  * Main IPC authorization remains authoritative for every create request.
+ *
+ * `skipQuery`: 远端 (SSH) 会话的 workingDir 是远端路径, 本机 fs 的项目插件
+ * 查询既无意义又会误拒; main 侧 assertCollabProjectEnabled 对 remote 已
+ * 放行, 这里跳过 IPC 查询直接按 enabled 处理。
  */
 export function useCollabProjectPolicy(
   workingDir: string | null | undefined,
   eligible: boolean,
+  opts?: { skipQuery?: boolean },
 ): CollabProjectPolicy {
+  const skipQuery = opts?.skipQuery === true;
   const requestedWorkingDir =
-    eligible && typeof workingDir === 'string'
+    eligible && !skipQuery && typeof workingDir === 'string'
       ? normalizeWorkingDirForProjectSettings(workingDir)
       : null;
   const [state, setState] = useState<PolicyState>({
@@ -136,6 +142,11 @@ export function useCollabProjectPolicy(
     };
   }, [refresh]);
 
+  const skipRefresh = useCallback(
+    (): Promise<PolicyResult> => Promise.resolve({ enabled: eligible, unavailable: false }),
+    [eligible],
+  );
+
   const current =
     requestedWorkingDir == null
       ? false
@@ -147,6 +158,10 @@ export function useCollabProjectPolicy(
     state.workingDir === requestedWorkingDir &&
     current === null &&
     state.unavailable;
+  if (skipQuery) {
+    // 远端会话: 不查本机 fs, main 侧已放行 (见函数 docstring)。
+    return { enabled: eligible, loading: false, unavailable: false, refresh: skipRefresh };
+  }
   return {
     enabled: current === true,
     loading: current === null && !unavailable,

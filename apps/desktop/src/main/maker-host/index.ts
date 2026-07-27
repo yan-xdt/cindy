@@ -15,6 +15,7 @@ import {
   ClaudeCodeAgent,
   CodexAgent,
   configureDefaultImageResizer,
+  type McpProvider,
 } from '@cindy/maker-core';
 import {
   getActiveCatalog,
@@ -106,6 +107,9 @@ import {
   registerCodexMcpThreadContext,
   unregisterCodexMcpThreadContext,
 } from '../mcp-integrations/codexEnvironment.js';
+import type { CodexHttpBridge } from '../mcp-integrations/codexHttpBridge.js';
+import { ensureRemoteMcpForward } from '../remote-ssh/codex-remote-mcp.js';
+import { buildCcRemoteHttpMcpServers } from './cc-remote-mcp.js';
 import { CODEX_DISABLED_BUILTIN_PLUGIN_IDS_KEY } from '../mcp-integrations/codexBuiltinToolPolicy.js';
 import { buildCodexProxySpawnArgs, CODEX_OPENAI_COMPACT_PROVIDER_ID } from './codex-gateway-config.js';
 import {
@@ -213,6 +217,17 @@ export function refreshProviderAccessAfterAuthChange(): void {
  * api_key 变更时 dispose 重建 app-server。getMaker() 构造后回填,resetMaker() 清空。
  */
 let _codexAgent: CodexAgent | null = null;
+/**
+ * codexMcpProviders 的模块级引用 —— 供 ensureCodexMcpBridgeStartedForRemote()
+ * 在远端 daemon MCP 注入链路里懒启动 bridge 时取用。getMaker() 构造后回填。
+ */
+let _codexMcpProviders: McpProvider[] | null = null;
+/**
+ * 本进程已对哪些 cc session 做过 bridge MCP 的强制 fresh start。bridge 是
+ * 进程内存态, 随 app 重启清空 — 重启后首轮注入重新强制 fresh; SSH 断线
+ * 重连 (bridge 表还在) 不重复 kill。见 remoteCcQueryFactory 注释。
+ */
+const forcedFreshCcBridgeSessions = new Set<string>();
 /** getMaker() 首次构造时发起的自定义 MCP 初始加载 promise，供 bootstrap 在注册会话 IPC 前 await。 */
 let _initialCustomMcpRefresh: Promise<void> | undefined;
 type CodexLocalCredentialChangeGuard = Awaited<ReturnType<CodexAgent['beginLocalHostCredentialChange']>>;
@@ -228,6 +243,35 @@ let _codexCredentialChangeGuard: CodexLocalCredentialChangeGuard | null = null;
 let _beforeLocalCodexSessionStartHook: (() => Promise<void>) | null = null;
 export function setBeforeLocalCodexSessionStartHook(hook: (() => Promise<void>) | null): void {
   _beforeLocalCodexSessionStartHook = hook;
+}
+
+/**
+ * 远端 codex daemon / cc query 经 SSH remote-forward 直连本机 MCP bridge 的
+ * 注入链路 (remote-ssh/codex-remote-mcp.ts、cc-remote-mcp 调用) 调用:确保
+ * HTTP bridge 已启动并返回端口、server 名单与 bridge 实例 (per-session
+ * token 注册需要)。与 prepareCodexExtraSpawnConfig 共用
+ * getCodexExtraSpawnConfig 的 lazy+cached 单例,不重复起 server;providers
+ * 未装配或 bridge 启动失败时返回 null (调用方按"远端无 MCP"降级放行 session)。
+ */
+export async function ensureCodexMcpBridgeStartedForRemote(): Promise<{
+  port: number;
+  serverNames: string[];
+  bridge: CodexHttpBridge;
+} | null> {
+  if (!_codexMcpProviders) return null;
+  try {
+    const cfg = await getCodexExtraSpawnConfig({
+      mcpProviders: _codexMcpProviders,
+      logger: desktopMakerLogger,
+    });
+    if (!cfg.bridge) return null;
+    return { port: cfg.bridge.port, serverNames: cfg.bridgeServerNames, bridge: cfg.bridge };
+  } catch (err) {
+    desktopMakerLogger.error('ensureCodexMcpBridgeStartedForRemote failed', {
+      message: err instanceof Error ? err.message : String(err),
+    });
+    return null;
+  }
 }
 
 export async function readCodexRuntimeRoute(): Promise<{
@@ -419,7 +463,7 @@ export function getMaker(): Maker {
       // RemoteQuery 实现 SDK Query interface 的子集 (ClaudeCodeAgent 实际只调
       // for-await / interrupt / setModel / setPermissionMode / applyFlagSettings),
       // factory 返回时直接 `as unknown as Query` cast 即可。
-      remoteCcQueryFactory: async ({ remoteHostId, sessionId, startParams, onApprovalRequest }) => {
+      remoteCcQueryFactory: async ({ remoteHostId, sessionId, startParams, vendorOptions, onApprovalRequest }) => {
         const host = getRemoteSshPool().get(remoteHostId);
         if (host?.getStatus() !== 'ready') {
           throw new Error(`remote ssh host not ready: ${remoteHostId}`);
@@ -429,13 +473,71 @@ export function getMaker(): Maker {
         // the path here and pass it down; cc-manager-client merges it into the SDK
         // options via `pathToClaudeCodeExecutable`. First call ~200ms, cache hit instant.
         const claudeBinaryPath = await getRemoteClaudeBinaryPath(host);
-        const { remoteQuery, dispose, detach } = await openCcManagerSession({
-          host,
-          sessionId,
-          startParams: startParams as unknown as Parameters<typeof openCcManagerSession>[0]['startParams'],
-          claudeBinaryPath,
-          onApprovalRequest: onApprovalRequest as Parameters<typeof openCcManagerSession>[0]['onApprovalRequest'],
-        });
+
+        // 远端 cc 的协同 MCP 恢复通道:bridge + remote-forward + per-session
+        // token,把 cindy_orca / orca_worker_bridge 以 http 形态追加进
+        // startParams.mcpServers (cc remote 过滤器本来就放行 http transport)。
+        // 注入失败降级为"远端无协同 MCP"(历史行为),不阻塞 session 建立。
+        let mcpCleanup: () => void = () => {};
+        let injectedServerCount = 0;
+        try {
+          const injected = await buildCcRemoteHttpMcpServers(
+            {
+              host,
+              sessionId,
+              workingDir: typeof startParams.cwd === 'string' ? startParams.cwd : '',
+              vendorOptions,
+            },
+            {
+              ensureBridgeStarted: ensureCodexMcpBridgeStartedForRemote,
+              ensureForward: ensureRemoteMcpForward,
+            },
+          );
+          mcpCleanup = injected.cleanup;
+          if (Object.keys(injected.servers).length > 0) {
+            injectedServerCount = Object.keys(injected.servers).length;
+            const mutableParams = startParams as { mcpServers?: Record<string, unknown> };
+            mutableParams.mcpServers = { ...(mutableParams.mcpServers ?? {}), ...injected.servers };
+          }
+        } catch (err) {
+          desktopMakerLogger.warn('cc remote MCP injection skipped', {
+            remoteHostId,
+            sessionId,
+            message: err instanceof Error ? err.message : String(err),
+          });
+        }
+
+        // app 重启后首轮 bridge MCP 注入:daemon 侧旧 query 若还 alive, 其
+        // SDK 持有的 mcp-session-id 在新 bridge 已不存在, attach 会让协同
+        // MCP 每次调用 404 且 SDK 不自动重新 initialize。本进程首次注入该
+        // session 时强制 fresh start (startParams 带 resumeSdkSessionId,
+        // 上下文经远端 cc CLI session 文件恢复)。SSH 断线重连 (app 未重启,
+        // bridge 内存表还在) 不触发 — 本 Set 随进程生命周期。
+        let forceFreshQuery = false;
+        if (injectedServerCount > 0 && !forcedFreshCcBridgeSessions.has(sessionId)) {
+          forceFreshQuery = true;
+          forcedFreshCcBridgeSessions.add(sessionId);
+        }
+
+        const { remoteQuery, dispose, detach } = await (async () => {
+          try {
+            return await openCcManagerSession({
+              host,
+              sessionId,
+              startParams: startParams as unknown as Parameters<typeof openCcManagerSession>[0]['startParams'],
+              claudeBinaryPath,
+              onApprovalRequest: onApprovalRequest as Parameters<typeof openCcManagerSession>[0]['onApprovalRequest'],
+              forceFreshQuery,
+            });
+          } catch (err) {
+            // openCcManagerSession 失败时上面注册的 per-session ctx / forward
+            // intent 必须清掉,否则残留到同 session 下一次重建或应用退出。
+            try {
+              mcpCleanup();
+            } catch { /* cleanup 失败不掩盖原始错误 */ }
+            throw err;
+          }
+        })();
 
         // 把 ssh transport disposer 串进 remoteQuery.close — maker-core 不知道
         // ssh / RpcClient / nc 这层 transport, 只会调它认得的 Query.close()。
@@ -444,8 +546,21 @@ export function getMaker(): Maker {
         // RpcClient, 再 handle.kill() 关 ssh exec。所以 close 直接重定向到
         // dispose 即可, 不需要分两步。漏接这个 hook 会让 ClaudeCodeAgent close
         // 时 ssh exec 一直挂着, 远端 nc 子进程也不退, 文件描述符泄漏。
+        // close 同时注销 per-session MCP token (detach 不清:detach 是断传输
+        // 保 session, 重连时 factory 会重新注册)。
+        const disposeWithMcpCleanup = async (): Promise<void> => {
+          try {
+            mcpCleanup();
+          } catch (err) {
+            desktopMakerLogger.warn('cc remote MCP token cleanup failed', {
+              sessionId,
+              message: err instanceof Error ? err.message : String(err),
+            });
+          }
+          await dispose();
+        };
         const remoteQueryWithDispose = Object.assign(remoteQuery, {
-          close: dispose,
+          close: disposeWithMcpCleanup,
           detach,
         });
         return remoteQueryWithDispose as unknown as RemoteCcQuery;
@@ -455,6 +570,7 @@ export function getMaker(): Maker {
       ...createDesktopMcpProviders(makerMemoryProviderDeps),
       orcaWorkerBridgeProvider,
     ];
+    _codexMcpProviders = codexMcpProviders;
     const codexAgent = new CodexAgent({
       auth: desktopCodexAuthAdapter,
       runtimeConfig: desktopCodexRuntimeConfig,

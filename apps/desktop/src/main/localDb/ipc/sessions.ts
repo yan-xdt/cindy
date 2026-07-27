@@ -20,6 +20,7 @@ import {
   sessionToCamel,
   sessionCreateToRow,
   sessionPatchToRow,
+  normalizeRemoteHostId,
   type SessionRowWithCount,
 } from '../mapper';
 import { ensureDialogueWorkspaceDir } from '../dialogueWorkspace';
@@ -301,6 +302,36 @@ const LATEST_MSG_ROLE_SQL = sql<string | null>`(
  * Resume 路径(scheduler runner / send_to_session)用它做归档/删除兜底和展示元数据返回。
  * 失败 swallow 返 null 而非抛 —— 调用方应当把 null 视作 NOT_FOUND, 由业务自己决定 fallback。
  */
+/**
+ * sessionId → remoteHostId 的进程内缓存 reader:session 的 remoteHostId 创建后
+ * 不变,lazy resume 路径每次 send 都经过 ensureRemoteReadyForSessionStart,避免
+ * 重复查库。查询成功(含行不存在)才缓存;DB 异常返回 null 但**不缓存** ——
+ * 一次瞬时 DB 失败不该永久关闭该 session 的 remote ensure 兜底(否则远端
+ * session 会被按本地会话处理远端 workingDir)。
+ */
+export function createSessionRemoteHostIdReader(): (sessionId: string) => Promise<string | null> {
+  const cache = new Map<string, string | null>();
+  return async (sessionId) => {
+    if (cache.has(sessionId)) {
+      return cache.get(sessionId) ?? null;
+    }
+    let value: string | null;
+    try {
+      const db = getDbClient().drizzle;
+      const [row] = await db
+        .select({ remoteHostId: sessions.remoteHostId })
+        .from(sessions)
+        .where(eq(sessions.id, sessionId))
+        .limit(1);
+      value = normalizeRemoteHostId(row?.remoteHostId ?? null);
+    } catch {
+      return null;
+    }
+    cache.set(sessionId, value);
+    return value;
+  };
+}
+
 export async function getSessionRowSnapshot(id: string): Promise<{
   status: string;
   title: string | null;
@@ -312,6 +343,8 @@ export async function getSessionRowSnapshot(id: string): Promise<{
   remoteHostId?: string | null;
   /** Hook exact-takeover must reject internal Orca worker sessions. */
   orcaRole?: 'lead' | 'worker' | null;
+  /** Collab policy gate: remote session 仅 codex 放行。 */
+  agentKind?: string | null;
 } | null> {
   try {
     const db = getDbClient().drizzle;
@@ -327,6 +360,7 @@ export async function getSessionRowSnapshot(id: string): Promise<{
         providerId: sessions.providerId,
         remoteHostId: sessions.remoteHostId,
         orcaRole: sessions.orcaRole,
+        agentKind: sessions.agentKind,
       })
       .from(sessions)
       .where(eq(sessions.id, id))

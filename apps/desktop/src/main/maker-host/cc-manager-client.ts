@@ -282,6 +282,16 @@ export async function openCcManagerSession(opts: {
    * are denied (same as the old hardcoded acceptEdits behavior).
    */
   onApprovalRequest?: (params: ApprovalRequestParams) => Promise<ApprovalRequestResult>;
+  /**
+   * 强制 fresh start:daemon 侧 session alive 时也先 kill 再走 start 路径
+   * (而非 attach)。用于本机 HTTP MCP bridge 重启 (app 重启) 后首轮注入:
+   * 旧 SDK 持有的 mcp-session-id 在新 bridge 已不存在, attach 会让协同
+   * MCP 的每次调用 404 且 SDK 不会自动重新 initialize。fresh start 经
+   * startParams.resumeSdkSessionId 恢复上下文 (远端 cc CLI session 文件
+   * 持久化在远端机器上)。SSH 断线重连 (app 未重启) 不要传:bridge 内存
+   * 表还在, attach 是对的。
+   */
+  forceFreshQuery?: boolean;
 }): Promise<{
   remoteQuery: RemoteQuery;
   dispose: () => Promise<void>;
@@ -366,7 +376,22 @@ export async function openCcManagerSession(opts: {
         daemonLastSeq: listedSession.lastSeq,
       });
     }
-    const existing = listedSession?.alive ? listedSession : undefined;
+    // forceFreshQuery:alive 也 kill + fresh (bridge MCP 重启后首轮注入,
+    // 见 opts.forceFreshQuery 注释)。
+    const killAliveForFresh = listedSession?.alive === true && opts.forceFreshQuery === true;
+    if (killAliveForFresh) {
+      await client.request(
+        METHODS.SESSION_KILL,
+        { sessionId: opts.sessionId },
+        { timeoutMs: RPC_REQUEST_TIMEOUT_MS },
+      ).catch(() => undefined);
+      log.info('cc-mgr: alive session killed for forced fresh start (bridge MCP re-inject)', {
+        hostId: opts.host.id,
+        sessionId: opts.sessionId,
+        daemonLastSeq: listedSession.lastSeq,
+      });
+    }
+    const existing = listedSession?.alive && !killAliveForFresh ? listedSession : undefined;
 
     // 对齐 codex 模式: alive → attach live-only, dead/absent → fresh start。
     // 不 replay 旧 events,不追踪 cursor。

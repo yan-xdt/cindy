@@ -1684,8 +1684,9 @@ export function CCAgentSessionView({
     shouldFirstFrameRevealOrcaWorkers,
   ]);
   // Lead 允许 Claude / Codex 本地项目会话走 toggle。Codex 的 MCP bridge 通过
-  // threadId -> business sessionId 映射在工具调用时恢复 per-session ctx。
-  // 远端协同还没有 worker remoteHostId 继承链,继续隐藏入口。
+  // threadId -> business sessionId 映射在工具调用时恢复 per-session ctx;
+  // 远端会话 (codex / cc) 经 SSH remote-forward 直连本机 MCP bridge,worker
+  // 创建继承 remoteHostId,两端协同均已接通。
   // 注意:doc rail (isCompactRail) 也允许显示 toggle —— WorkdirBrowseRoute 已经
   // 针对 Lead session 接入了 OrcaSplitView toggle 布局,普通 session 必须能从
   // ChatInput 工具行启用协同变成 Lead,否则 doc 模式下首次开启入口完全没有。
@@ -1693,10 +1694,14 @@ export function CCAgentSessionView({
   const collabPolicyEligible =
     !orcaMode &&
     session?.orcaRole !== 'worker' &&
-    session?.remoteHostId == null &&
+    // 远端会话 codex 与 cc 都已接通协同(worker 创建继承 remoteHostId,
+    // 远端 agent 经 SSH remote-forward 直连本机 MCP bridge),不再按 agent 限流。
     session?.workspaceKind === 'project' &&
     !!session?.workingDir;
-  const collabPolicy = useCollabProjectPolicy(session?.workingDir, collabPolicyEligible);
+  const collabPolicy = useCollabProjectPolicy(session?.workingDir, collabPolicyEligible, {
+    // 远端会话的 workingDir 是远端路径, 不查本机项目插件配置 (main 已放行)。
+    skipQuery: !!session?.remoteHostId,
+  });
   const allowCollabToggle = !orcaMode && collabPolicyEligible;
   // 把 sessionId 抽出来给 useEffect 用 (linter 偏好稳定的标量依赖)
   const collabSessionId = sessionId;

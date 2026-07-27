@@ -33,7 +33,7 @@ describe('assertCollabProjectEnabled', () => {
     expect(checkedPath).toBe('C:\\projects\\cindy');
   });
 
-  it('rejects dialogue and remote sessions before checking plugin policy', () => {
+  it('rejects dialogue sessions regardless of plugin policy', () => {
     const isPluginEnabled = () => {
       throw new Error('must not query project policy for an ineligible session');
     };
@@ -45,11 +45,34 @@ describe('assertCollabProjectEnabled', () => {
       ),
     ).toThrow('[PRECONDITION_FAILED] collaboration requires an enabled local project session');
 
+    // 远端会话同样是项目会话才放行:无 workingDir 的远端 dialogue 照样拒绝。
     expect(() =>
       assertCollabProjectEnabled(
-        { ...project, remoteHostId: 'remote-device' },
+        { workingDir: null, workspaceKind: 'dialogue', remoteHostId: 'host-1' },
         isPluginEnabled,
       ),
     ).toThrow('[PRECONDITION_FAILED] collaboration requires an enabled local project session');
+  });
+
+  it('allows remote project sessions for both agents without querying local fs policy', () => {
+    // 远端 workingDir 是远端机器路径, 本机 fs 的项目插件查询无意义 —— remote
+    // 一律跳过 isPluginEnabled (main 侧边界: bridge 注入白名单兜底)。
+    const isPluginEnabled = () => {
+      throw new Error('must not query local fs policy for a remote session');
+    };
+
+    expect(() =>
+      assertCollabProjectEnabled(
+        { ...project, workingDir: '/remote/repo', remoteHostId: 'host-1', agentKind: 'codex' },
+        isPluginEnabled,
+      ),
+    ).not.toThrow();
+
+    expect(() =>
+      assertCollabProjectEnabled(
+        { ...project, workingDir: '/remote/repo', remoteHostId: 'host-1', agentKind: 'claude-code' },
+        isPluginEnabled,
+      ),
+    ).not.toThrow();
   });
 });

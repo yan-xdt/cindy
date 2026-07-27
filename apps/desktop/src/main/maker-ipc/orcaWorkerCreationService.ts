@@ -21,6 +21,12 @@ export interface OrcaLeadSessionSnapshot {
   permissionMode: string;
   fastMode: boolean;
   providerId: string | null;
+  /**
+   * lead 的 SSH 远端 host id;非空时 worker 必须继承 (在同一个远端跑),
+   * 否则 worker 会以远端 workingDir 在本机 spawn —— 指向不存在或同名的
+   * 本机目录。null = 本地 lead,worker 也是本地。
+   */
+  remoteHostId: string | null;
 }
 
 /** worker limit 与 duplicate label 校验只需要 worker 的身份、label 与占槽状态。 */
@@ -201,6 +207,15 @@ export interface OrcaWorkerCreationDeps {
   createId(): string;
   createSessionId(): string;
   buildCreateOptsWithStderr(opts: MakerSessionCreateOpts): MakerSessionCreateOpts;
+  /**
+   * 远端 session start 前置 (SSH 重连 / agent 安装 / codex daemon MCP 注入)。
+   * remote lead 的 worker 继承了 remoteHostId,创建前必须走与本机
+   * send/resume 相同的 ensure,否则远端 daemon 的协同 MCP 通道不就绪。
+   * 可选:未注入时按本地创建处理 (测试与本地 lead 场景)。
+   */
+  ensureRemoteReadyForSessionStart?: (params: {
+    createOpts: MakerSessionCreateOpts;
+  }) => Promise<void>;
   bootstrapSession(opts: MakerSessionCreateOpts): Promise<{
     session: { id: string; agentKind: AgentKind };
     didInjectOrcaInstructions: boolean;
@@ -708,6 +723,9 @@ export function createOrcaWorkerCreationService(deps: OrcaWorkerCreationDeps): O
         id: workerSessionId,
         agentKind: params.agent,
         workingDir: lead.workingDir ?? '',
+        // remote lead 的 worker 继承 remoteHostId:在同一台远端主机上 spawn,
+        // 与 lead 共享远端 workingDir;本地 lead 不带此字段 (本地 worker)。
+        ...(lead.remoteHostId ? { remoteHostId: lead.remoteHostId } : {}),
         model: resolved.model,
         providerId: resolved.providerId,
         effort: resolved.effort as MakerSessionCreateOpts['effort'],
@@ -720,6 +738,11 @@ export function createOrcaWorkerCreationService(deps: OrcaWorkerCreationDeps): O
 
       let workerSession: { id: string; agentKind: AgentKind };
       try {
+        // 远端 worker:创建前确保 SSH / agent / codex daemon MCP 注入就绪
+        // (本地 lead 时 remoteHostId 为空, ensure 内部直接返回)。
+        if (lead.remoteHostId && deps.ensureRemoteReadyForSessionStart) {
+          await deps.ensureRemoteReadyForSessionStart({ createOpts: workerOpts });
+        }
         const bootstrapped = await deps.bootstrapSession(workerOpts);
         workerSession = bootstrapped.session;
       } catch (err) {

@@ -16,6 +16,7 @@ import {
   startCodexHttpBridge,
   type CodexHttpBridge,
 } from './codexHttpBridge.js';
+import { getRemoteMcpBridgeToken } from './remoteMcpBridgeToken.js';
 
 const TOKEN_ENV = 'LIZI_MCP_TOKEN';
 const MCP_TIMEOUT_SEC = 10 * 60;
@@ -39,6 +40,8 @@ export interface CodexExtraSpawnConfig {
   extraEnv: Record<string, string>;
   /** 暴露 bridge 给诊断 / 测试用，业务侧通常不直接用；只有纯远程 MCP 时为 null。 */
   bridge: CodexHttpBridge | null;
+  /** bridge 上实际挂出的 server 名 (远端注入 config.toml 时按此渲染 mcp_servers 段)。 */
+  bridgeServerNames: string[];
 }
 
 export interface GetCodexExtraSpawnConfigOptions {
@@ -223,6 +226,13 @@ async function doStart(
     ? await startCodexHttpBridge({
         serverFactories,
         pluginIdByServerName,
+        // 远端常驻 daemon 经 SSH remote-forward 直连本 bridge:接受 persistent
+        // token (safeStorage, 跨 app 重启稳定)。函数形式读取,token 首用时惰性
+        // 生成也能被后续请求命中。safeStorage 不可用时返回 [],不影响本地。
+        additionalBearerTokens: () => {
+          const t = getRemoteMcpBridgeToken();
+          return t ? [t] : [];
+        },
         logger: opts.logger,
       })
     : null;
@@ -270,5 +280,6 @@ async function doStart(
       ...(bridge ? { [TOKEN_ENV]: bridge.token } : {}),
     },
     bridge,
+    bridgeServerNames: Object.keys(serverFactories),
   };
 }

@@ -14,6 +14,8 @@ export type {
   ExecResult,
   ExecStreamOpts,
   ExecStreamHandle,
+  RemoteForwardSpec,
+  RemoteForwardInfo,
 } from './RemoteHost.js';
 
 export {

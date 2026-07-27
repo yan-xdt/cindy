@@ -130,6 +130,7 @@ import {
   applyAgentSwitchResumeFallbackAtomically,
   broadcastSessionPatched,
   clearSessionContextInDb,
+  createSessionRemoteHostIdReader,
   getSessionRowSnapshot,
   persistSessionFields,
   persistSessionPermissionModeIfAuto,
@@ -175,6 +176,7 @@ import {
 import { createGitSnapshotCoordinator } from '../maker-host/git-snapshot-host.js';
 import {
   cancelCodexAuthModeChange,
+  ensureCodexMcpBridgeStartedForRemote,
   finalizeCodexAfterAuthModeChange,
   getPluginRegistry,
   prepareCodexForAuthModeChange,
@@ -250,6 +252,7 @@ import {
   saveTurnStartedAtForDeferred,
 } from '../messagePersistBroadcaster.js';
 import { ensureCcManagerInstalledOrInstall } from '../remote-ssh/cc-manager-install.js';
+import { ensureRemoteCodexMcpBridge } from '../remote-ssh/codex-remote-mcp.js';
 import { ensureRemoteAgentInstalledOrInstall, ensureRemoteHostReady, getRemoteSshPool, isCcMgrUpgradeInFlight } from '../remote-ssh/index.js';
 import {
   recordSessionContextSnapshot,
@@ -4077,12 +4080,22 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions 
       resumeSessionId: row.sdkSessionId ?? undefined,
       orcaRole: row.orcaRole as 'worker' | null,
       vendorOptions: workerVendorOptions,
+      // 远端 worker 唤醒必须带上 remoteHostId 并走 ensure (SSH 重连 / agent
+      // 安装 / codex daemon MCP 注入), 否则会以远端 workingDir 在本机 spawn,
+      // 且远端 daemon 的协同 MCP 通道不就绪。
+      remoteHostId: row.remoteHostId ?? undefined,
       ...(extraDirs.length > 0 ? { extraDirs } : {}),
     });
+    await ensureRemoteReadyForSessionStart({ createOpts: opts });
     const { session: resumedSession } = await bootstrapSession(opts);
     await markOrcaRoleIfNeeded(resumedSession.id, 'worker');
     return true;
   }
+
+  // sessionId → remoteHostId 的进程内缓存 reader(lazy resume 路径每次 send 都
+  // 经过 ensureRemoteReadyForSessionStart;实现与缓存语义见 localDb/ipc/sessions.ts,
+  // DB 异常不缓存 null)。
+  const readSessionRemoteHostIdCached = createSessionRemoteHostIdReader();
 
   async function ensureRemoteReadyForSessionStart(params: {
     session?: { agentKind: AgentKind; remoteHostId: string | null } | null;
@@ -4097,7 +4110,21 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions 
       createOpts && typeof createOpts === 'object'
         ? ((createOpts as { remoteHostId?: string }).remoteHostId ?? null)
         : null;
-    const remoteHostIdToEnsure = sessRemoteHostId ?? coRemoteHostId;
+    let remoteHostIdToEnsure = sessRemoteHostId ?? coRemoteHostId;
+    if (!remoteHostIdToEnsure) {
+      // DB 兜底:live session 缺失 (lazy resume) 且调用方快照未带 remoteHostId
+      // 时 (main 侧发起的 Orca worker 派活 / scheduler 等路径),从 sessions 行
+      // 对齐——否则 remote worker 会以远端 workingDir 在本机 spawn。session 的
+      // remoteHostId 创建后不变,进程内缓存安全。
+      const sessionIdForLookup =
+        (session as { id?: string } | null | undefined)?.id ??
+        (createOpts && typeof createOpts === 'object'
+          ? (createOpts as { id?: unknown }).id
+          : null);
+      if (typeof sessionIdForLookup === 'string' && sessionIdForLookup) {
+        remoteHostIdToEnsure = await readSessionRemoteHostIdCached(sessionIdForLookup);
+      }
+    }
     if (!remoteHostIdToEnsure) return;
 
     if (createOpts && typeof createOpts === 'object') {
@@ -4130,13 +4157,42 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions 
     }
 
     await ensureRemoteAgentInstalledOrInstall(remoteHostIdToEnsure, ensureAgentKind);
+
+    // codex 远端 daemon 的 MCP 注入 (cindy_orca / orca_worker_bridge 等经 SSH
+    // remote-forward 直连本机 HTTP bridge):转发 / config.toml / daemon env
+    // 就绪必须先于 transport 创建 (daemon discover/bootstrap)。best-effort —
+    // 失败时 session 按"远端无 MCP"放行,与历史行为一致;协同类工具此时不可用。
+    if (ensureAgentKind === 'codex') {
+      const host = getRemoteSshPool().get(remoteHostIdToEnsure);
+      if (host?.getStatus() === 'ready') {
+        await ensureRemoteCodexMcpBridge(host, {
+          ensureBridgeStarted: ensureCodexMcpBridgeStartedForRemote,
+          // config 漂移生效要重启 daemon, 重启会断同 host 的 live turn:
+          // 有 turn 在跑时本次降级 (config 留旧值, 下次 ensure 重试)。
+          hasLiveTurnOnHost: (hostId) =>
+            maker.listActiveSessions().some(
+              (s) =>
+                s.remoteHostId === hostId &&
+                s.agentKind === 'codex' &&
+                (agentInputCoordinatorHolder?.hasActiveTurnForRewind(s.id) ?? false),
+            ),
+        });
+      }
+    }
   }
 
   const makerSessionRegistry = createElectronIpcHandlerRegistry();
   registerMakerSessionCreateHandler(
     makerSessionRegistry,
     {
-      bootstrapSession,
+      // CREATE_SESSION 同样先走 remote ensure:remote draft (尤其 collab
+      // lead) 的 SSH 重连 / agent 安装 / codex daemon MCP 注入必须先于
+      // bootstrap, 否则 lead 首个 turn 没有 cindy_orca, 与 orca 架构文档的
+      // "session start/resume 前置" 契约不符。本地会话 ensure 内部直接返回。
+      bootstrapSession: async (co) => {
+        await ensureRemoteReadyForSessionStart({ createOpts: co });
+        return bootstrapSession(co);
+      },
       markOrcaRoleIfNeeded,
       markKnownNonOrcaIfApplicable,
       allocateDialogueWorkspace: ensureDialogueWorkspaceDir,
@@ -4276,6 +4332,10 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions 
         planMode: false,
         title: row.title ?? undefined,
         resumeSessionId: row.sdkSessionId ?? undefined,
+        // 远端会话切换引擎后仍是远端:带回 remoteHostId 并走 ensure (SSH
+        // 重连 / agent 安装 / codex daemon MCP 注入), 否则会以远端
+        // workingDir 在本机 spawn。
+        remoteHostId: row.remoteHostId ?? undefined,
       });
       if (co.extraDirs === undefined) {
         try {
@@ -4288,6 +4348,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions 
           });
         }
       }
+      await ensureRemoteReadyForSessionStart({ createOpts: co });
       await bootstrapSession(co);
       broadcastSessionCreated(sessionId);
     },
@@ -4431,6 +4492,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions 
         workingDir: normalizedWorkingDir,
         workspaceKind,
         remoteHostId: lead?.remoteHostId ?? leadRow?.remoteHostId,
+        agentKind: lead?.agentKind ?? leadRow?.agentKind ?? null,
       },
       (pluginId, workingDir) => getPluginRegistry().isEnabled(pluginId, workingDir),
     );
@@ -4904,6 +4966,10 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions 
             });
           }
         }
+        // lazy-resume 也要走 remote ensure:Orca 派活 / scheduler 等 main 侧
+        // 通路不带 remoteHostId 快照, ensure 内部会从 sessions 行兜底回填并
+        // 完成 SSH 重连 / agent 安装 / codex daemon MCP 注入。
+        await ensureRemoteReadyForSessionStart({ createOpts });
         const { session } = await bootstrapSession(createOpts);
         await markOrcaRoleIfNeeded(session.id, createOpts.orcaRole);
         const sendResult = await sendUserMessageWithAwaitedGitBaseline(
@@ -5648,6 +5714,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions 
         permissionMode: leadRow.permissionMode,
         fastMode: !!leadRow.fastMode,
         providerId: leadRow.providerId ?? null,
+        remoteHostId: leadRow.remoteHostId ?? null,
       };
     },
     getWorkerDefaults: getWorkerDefaultsFromNewMaker,
@@ -5705,6 +5772,9 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions 
     createId,
     createSessionId: createBusinessSessionId,
     buildCreateOptsWithStderr,
+    ensureRemoteReadyForSessionStart: async (params) => {
+      await ensureRemoteReadyForSessionStart({ createOpts: params.createOpts });
+    },
     bootstrapSession,
     addOrUpdateWorker: async (worker) => {
       await addOrUpdateWorker(worker);
