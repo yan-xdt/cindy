@@ -151,7 +151,12 @@ export async function startCodexHttpBridge(
         if (!sessionTokenCtx) {
           res.statusCode = 401;
           res.end();
-          log.warn('rejected request with unregistered session query', { url: req.url });
+          // 不落完整 url:query 里的明文 sessionId 无诊断价值,只记路径与
+          // 截断标识。
+          log.warn('rejected request with unregistered session query', {
+            path: url.pathname,
+            session: prefixId(sessionQuery),
+          });
           return;
         }
       }

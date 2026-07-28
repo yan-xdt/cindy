@@ -24,7 +24,7 @@ const SERVERS = ['cindy_orca', 'orca_worker_bridge'];
 
 describe('renderManagedMcpBlock', () => {
   it('renders one mcp_servers table per server with bridge url and bearer env var', () => {
-    const block = renderManagedMcpBlock({ remotePort: 47921, serverNames: SERVERS });
+    const block = renderManagedMcpBlock({ remotePort: 47921, serverNames: SERVERS, tokenFingerprint: 'fp-test' });
     expect(block).toContain('[mcp_servers.cindy_orca]');
     expect(block).toContain('url = "http://127.0.0.1:47921/mcp/cindy_orca"');
     expect(block).toContain('[mcp_servers.orca_worker_bridge]');
@@ -34,14 +34,29 @@ describe('renderManagedMcpBlock', () => {
   });
 
   it('is wrapped in managed begin/end markers', () => {
-    const block = renderManagedMcpBlock({ remotePort: 47921, serverNames: SERVERS });
+    const block = renderManagedMcpBlock({ remotePort: 47921, serverNames: SERVERS, tokenFingerprint: 'fp-test' });
     expect(block.startsWith('# >>> cindy-remote-mcp')).toBe(true);
     expect(block.trimEnd().endsWith('# <<< cindy-remote-mcp <<<')).toBe(true);
+  });
+
+  it('embeds the token fingerprint so token rotation counts as config drift', () => {
+    // review P1 回归:账号切换后 token 重生成, daemon env 还是旧 token;
+    // fingerprint 进受管段 → changed=true → bootstrap 重启 daemon。
+    const oldBlock = renderManagedMcpBlock({ remotePort: 47921, serverNames: SERVERS, tokenFingerprint: 'fp-old' });
+    const rotated = renderManagedMcpBlock({ remotePort: 47921, serverNames: SERVERS, tokenFingerprint: 'fp-new' });
+    expect(oldBlock).toContain('# cindy-token-fingerprint: fp-old');
+    const existing = mergeManagedMcpBlock('', oldBlock).next;
+    const { changed, next } = mergeManagedMcpBlock(existing, rotated);
+    expect(changed).toBe(true);
+    expect(next).toContain('# cindy-token-fingerprint: fp-new');
+    // fingerprint 不变时保持幂等 (不触发 daemon 重启)。
+    const quiet = mergeManagedMcpBlock(existing, oldBlock);
+    expect(quiet.changed).toBe(false);
   });
 });
 
 describe('mergeManagedMcpBlock', () => {
-  const block = renderManagedMcpBlock({ remotePort: 47921, serverNames: SERVERS });
+  const block = renderManagedMcpBlock({ remotePort: 47921, serverNames: SERVERS, tokenFingerprint: 'fp-test' });
 
   it('appends to an empty config', () => {
     const { next, changed } = mergeManagedMcpBlock('', block);
@@ -67,9 +82,9 @@ describe('mergeManagedMcpBlock', () => {
   });
 
   it('replaces a stale managed block in place (port change) and keeps surrounding content', () => {
-    const stale = renderManagedMcpBlock({ remotePort: 47921, serverNames: SERVERS });
+    const stale = renderManagedMcpBlock({ remotePort: 47921, serverNames: SERVERS, tokenFingerprint: 'fp-test' });
     const existing = `model = "gpt-5.5"\n\n${stale}\n\n[history]\npersistence = "save-all"\n`;
-    const fresh = renderManagedMcpBlock({ remotePort: 47930, serverNames: SERVERS });
+    const fresh = renderManagedMcpBlock({ remotePort: 47930, serverNames: SERVERS, tokenFingerprint: 'fp-test' });
     const { next, changed } = mergeManagedMcpBlock(existing, fresh);
     expect(changed).toBe(true);
     expect(next).toContain('url = "http://127.0.0.1:47930/mcp/cindy_orca"');
@@ -81,9 +96,9 @@ describe('mergeManagedMcpBlock', () => {
   });
 
   it('drops a server removed from the bridge list on next merge', () => {
-    const twoServers = renderManagedMcpBlock({ remotePort: 47921, serverNames: SERVERS });
+    const twoServers = renderManagedMcpBlock({ remotePort: 47921, serverNames: SERVERS, tokenFingerprint: 'fp-test' });
     const existing = mergeManagedMcpBlock('', twoServers).next;
-    const oneServer = renderManagedMcpBlock({ remotePort: 47921, serverNames: ['cindy_orca'] });
+    const oneServer = renderManagedMcpBlock({ remotePort: 47921, serverNames: ['cindy_orca'], tokenFingerprint: 'fp-test' });
     const { next, changed } = mergeManagedMcpBlock(existing, oneServer);
     expect(changed).toBe(true);
     expect(next).toContain('[mcp_servers.cindy_orca]');

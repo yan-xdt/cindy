@@ -1805,7 +1805,8 @@ export class ClaudeCodeAgent extends BaseAgent {
           // 协同身份以 session 自己的 vendorOptions 为准 (worker 首次创建时
           // DB 标记尚未写入, host 现场查库会拿到空角色)。见 base-agent.ts
           // remoteCcQueryFactory 的 vendorOptions 注释。
-          vendorOptions: vo,          onApprovalRequest: async (rawParams: unknown) => {
+          vendorOptions: vo,
+          onApprovalRequest: async (rawParams: unknown) => {
             // 110s timeout — must respond before daemon's 120s server-request timeout.
             // On timeout, dismiss the pending interaction (clears UI) and reject to
             // let cc-manager-client return deny to daemon.

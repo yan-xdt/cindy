@@ -66,8 +66,12 @@ export interface CcRemoteHttpMcpDeps {
   } | null>;
   ensureForward: (host: RemoteHost, localBridgePort: number) => Promise<number>;
   synthesizeVendorOptions?: (sessionId: string) => Promise<Record<string, unknown>>;
-  /** 持久 bridge token;测试注入 stub,生产默认 safeStorage 真源。 */
-  getBridgeToken?: () => Promise<string>;
+  /**
+   * 持久 bridge token;测试注入 stub,生产默认 safeStorage 真源。
+   * 可同步可异步;返回 null = token 不可用,注入降级为空 (不得下发
+   * "Bearer null")。
+   */
+  getBridgeToken?: () => Promise<string | null> | string | null;
 }
 
 export interface CcRemoteHttpMcpServerConfig {

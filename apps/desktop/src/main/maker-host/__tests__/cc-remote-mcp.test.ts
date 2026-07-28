@@ -176,7 +176,7 @@ describe('buildCcRemoteHttpMcpServers', () => {
       {
         ensureBridgeStarted: async () => ({ port: 38080, serverNames: ['cindy_orca'], bridge }),
         ensureForward: vi.fn(async () => 47921),
-        getBridgeToken: async () => null as unknown as string,
+        getBridgeToken: async () => null,
         synthesizeVendorOptions: async () => ({}),
       },
     );

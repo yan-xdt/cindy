@@ -403,7 +403,8 @@ describe('prompt-each-time never turns into a persisted grant', () => {
     // 让 canUseTool 跑到 dispatchInteraction 并登记 pending。
     await new Promise((resolve) => setImmediate(resolve));
 
-    await handle.setPermissionMode('bypassPermissions');
+    // CC agent 实现了 setPermissionMode (接口上可选是因为其他 agent 可缺省)。
+    await handle.setPermissionMode!('bypassPermissions');
 
     // 切到 Full access 也不能替用户批准这一次高风险调用。
     expect((await pending).behavior).toBe('deny');
@@ -420,7 +421,7 @@ describe('prompt-each-time never turns into a persisted grant', () => {
     });
     await new Promise((resolve) => setImmediate(resolve));
 
-    await handle.setPermissionMode('bypassPermissions');
+    await handle.setPermissionMode!('bypassPermissions');
 
     expect((await pending).behavior).toBe('allow');
     await handle.close();
@@ -606,7 +607,7 @@ describe('remote sessions share the same permission semantics', () => {
       remoteHostId: 'remote-1',
       permissionMode: 'default',
     });
-    handle.setInteractionResolver(() => ({ kind: 'permission', behavior: 'allow' }));
+    handle.setInteractionResolver(() => Promise.resolve({ kind: 'permission', behavior: 'allow' }));
     if (!onApprovalRequest) throw new Error('expected remote onApprovalRequest');
 
     const result = await onApprovalRequest({

@@ -343,7 +343,7 @@ export async function getSessionRowSnapshot(id: string): Promise<{
   remoteHostId?: string | null;
   /** Hook exact-takeover must reject internal Orca worker sessions. */
   orcaRole?: 'lead' | 'worker' | null;
-  /** Collab policy gate: remote session 仅 codex 放行。 */
+  /** Collab policy gate: remote session 的 codex / claude-code 均放行。 */
   agentKind?: string | null;
 } | null> {
   try {

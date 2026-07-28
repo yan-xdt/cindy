@@ -59,10 +59,12 @@ describe('remoteCcQueryFactory cleanup wiring', () => {
     // mcp-session-id 在新 bridge 不存在, attach 会让协同 MCP 永久 404。
     // factory 必须在首轮注入时传 forceFreshQuery, cc-manager-client 据此
     // kill alive + fresh start (resumeSdkSessionId 保上下文)。
+    // greptile P1 回归:fresh 状态只在 open 成功后提交, 失败时下次重试
+    // 仍要 forceFresh — add 必须在 forceFreshQuery 传参之后。
+    const passDown = source.indexOf('forceFreshQuery,');
+    expect(passDown).toBeGreaterThan(-1);
     const gate = source.indexOf('forcedFreshCcBridgeSessions.add(sessionId)');
-    expect(gate).toBeGreaterThan(-1);
-    const passDown = source.indexOf('forceFreshQuery,', gate);
-    expect(passDown).toBeGreaterThan(gate);
+    expect(gate).toBeGreaterThan(passDown);
 
     const killFirst = ccManagerClientSource.indexOf('killAliveForFresh');
     expect(killFirst).toBeGreaterThan(-1);

@@ -25,6 +25,7 @@
  */
 
 import { app } from 'electron';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -39,6 +40,11 @@ const FORWARD_ID = 'codex-mcp-bridge';
 const TOKEN_ENV = 'LIZI_MCP_TOKEN';
 const MANAGED_BEGIN = '# >>> cindy-remote-mcp (managed, do not edit) >>>';
 const MANAGED_END = '# <<< cindy-remote-mcp <<<';
+/**
+ * 受管段内 token 指纹注释行前缀 (见 renderManagedMcpBlock)。merge 的残留
+ * 判定必须认识它, 否则该行被当成用户内容剥出受管段, 幂等漂移检测失效。
+ */
+const TOKEN_FINGERPRINT_PREFIX = '# cindy-token-fingerprint:';
 /** per-host 固定远端端口的起始探测值与探测上限。 */
 const DEFAULT_REMOTE_PORT_START = 47921;
 const MAX_PORT_ATTEMPTS = 20;
@@ -99,6 +105,10 @@ function writeHostRemotePort(hostId: string, remotePort: number): void {
   const next = { ...readPortPrefs(), [hostId]: { remotePort } };
   const file = portPrefsPath();
   const tmp = `${file}.tmp`;
+  // userData 在真实 app 里由 electron 保证存在; 测试 stub 只拼路径不建
+  // 目录, 全新环境直接 writeFileSync 会 ENOENT (CI 回归: 目录依赖测试
+  // 执行顺序)。recursive mkdir 对已有目录是 no-op。
+  fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(tmp, JSON.stringify(next, null, 2), 'utf-8');
   fs.renameSync(tmp, file);
   portPrefsCache = next;
@@ -112,6 +122,7 @@ export function removeRemoteMcpForwardPref(hostId: string): void {
   delete next[hostId];
   const file = portPrefsPath();
   const tmp = `${file}.tmp`;
+  fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(tmp, JSON.stringify(next, null, 2), 'utf-8');
   fs.renameSync(tmp, file);
   portPrefsCache = next;
@@ -123,8 +134,14 @@ export function removeRemoteMcpForwardPref(hostId: string): void {
 export function renderManagedMcpBlock(opts: {
   remotePort: number;
   serverNames: string[];
+  /**
+   * 当前 bridge token 的指纹 (sha256 前 12 hex, 非 token 本身)。写进受管段
+   * 让 token 轮换 (账号切换清空重生成) 也构成 config 漂移 — 否则 daemon
+   * env 里的旧 token 不失效, config 无漂移不重启, 远端请求全部 401。
+   */
+  tokenFingerprint: string;
 }): string {
-  const lines: string[] = [MANAGED_BEGIN];
+  const lines: string[] = [MANAGED_BEGIN, `${TOKEN_FINGERPRINT_PREFIX} ${opts.tokenFingerprint}`];
   for (const name of opts.serverNames) {
     lines.push(
       `[mcp_servers.${name}]`,
@@ -174,6 +191,7 @@ function userMcpServerHeader(line: string, serverNames: string[]): string | null
 function isManagedResidueLine(line: string): boolean {
   const t = line.trim();
   if (t === '') return true;
+  if (t.startsWith(TOKEN_FINGERPRINT_PREFIX)) return true;
   const header = parseTableHeaderKey(t);
   if (header && header[0] === 'mcp_servers') return true;
   return /^(url|bearer_token_env_var|startup_timeout_sec|tool_timeout_sec)\s*=/.test(t);
@@ -466,8 +484,13 @@ async function doEnsureRemoteCodexMcpBridge(
 
     const remotePort = await ensureRemotePort(host, bridge.port);
 
+    const tokenFingerprint = createHash('sha256').update(token, 'utf8').digest('hex').slice(0, 12);
     const existing = await readRemoteConfig(host);
-    const block = renderManagedMcpBlock({ remotePort, serverNames: bridge.serverNames });
+    const block = renderManagedMcpBlock({
+      remotePort,
+      serverNames: bridge.serverNames,
+      tokenFingerprint,
+    });
     const { next, changed, strippedUserServers } = mergeManagedMcpBlock(existing, block, {
       serverNames: bridge.serverNames,
     });
