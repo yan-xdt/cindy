@@ -4,7 +4,7 @@
  * 追加语义(漂移检测是"内容一致则不重写、不重启 daemon"的前提)。
  */
 
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { RemoteHost } from '@cindy/maker-remote-ssh';
 
@@ -12,6 +12,7 @@ import {
   renderManagedMcpBlock,
   mergeManagedMcpBlock,
   ensureRemoteCodexMcpBridge,
+  getRemoteCodexDaemonProxyEnv,
 } from '../codex-remote-mcp.js';
 
 // safeStorage 在测试 stub 里 isEncryptionAvailable=false → token 真源恒 null;
@@ -21,6 +22,28 @@ vi.mock('../../mcp-integrations/remoteMcpBridgeToken.js', () => ({
 }));
 
 const SERVERS = ['cindy_orca', 'orca_worker_bridge'];
+const REMOTE_CODEX_PROXY_ENV_KEYS = [
+  'CINDY_REMOTE_CODEX_PROXY_URL',
+  'CINDY_REMOTE_CODEX_HTTP_PROXY',
+  'CINDY_REMOTE_CODEX_HTTPS_PROXY',
+  'CINDY_REMOTE_CODEX_ALL_PROXY',
+  'CINDY_REMOTE_CODEX_NO_PROXY',
+];
+const ORIGINAL_REMOTE_CODEX_PROXY_ENV = new Map(
+  REMOTE_CODEX_PROXY_ENV_KEYS.map((key) => [key, process.env[key]]),
+);
+
+beforeEach(() => {
+  for (const key of REMOTE_CODEX_PROXY_ENV_KEYS) delete process.env[key];
+});
+
+afterEach(() => {
+  for (const key of REMOTE_CODEX_PROXY_ENV_KEYS) {
+    const original = ORIGINAL_REMOTE_CODEX_PROXY_ENV.get(key);
+    if (original === undefined) delete process.env[key];
+    else process.env[key] = original;
+  }
+});
 
 describe('renderManagedMcpBlock', () => {
   it('renders one mcp_servers table per server with bridge url and bearer env var', () => {
@@ -52,6 +75,45 @@ describe('renderManagedMcpBlock', () => {
     // fingerprint 不变时保持幂等 (不触发 daemon 重启)。
     const quiet = mergeManagedMcpBlock(existing, oldBlock);
     expect(quiet.changed).toBe(false);
+  });
+
+  it('embeds the proxy fingerprint so daemon proxy env changes count as config drift', () => {
+    const withoutProxy = renderManagedMcpBlock({
+      remotePort: 47921,
+      serverNames: SERVERS,
+      tokenFingerprint: 'fp-token',
+    });
+    const withProxy = renderManagedMcpBlock({
+      remotePort: 47921,
+      serverNames: SERVERS,
+      tokenFingerprint: 'fp-token',
+      proxyFingerprint: 'fp-proxy',
+    });
+    const existing = mergeManagedMcpBlock('', withoutProxy).next;
+    const { changed, next } = mergeManagedMcpBlock(existing, withProxy);
+    expect(changed).toBe(true);
+    expect(next).toContain('# cindy-proxy-fingerprint: fp-proxy');
+  });
+});
+
+describe('getRemoteCodexDaemonProxyEnv', () => {
+  it('builds per-scheme proxy env with localhost no_proxy guard', () => {
+    const env = getRemoteCodexDaemonProxyEnv({
+      CINDY_REMOTE_CODEX_PROXY_URL: ' http://127.0.0.1:7890 ',
+      CINDY_REMOTE_CODEX_NO_PROXY: 'example.internal, localhost',
+    } as NodeJS.ProcessEnv);
+    expect(env).toMatchObject({
+      HTTP_PROXY: 'http://127.0.0.1:7890',
+      HTTPS_PROXY: 'http://127.0.0.1:7890',
+      NO_PROXY: 'example.internal,localhost,127.0.0.1,::1',
+    });
+    expect(env).not.toHaveProperty('http_proxy');
+    expect(env).not.toHaveProperty('https_proxy');
+    expect(env).not.toHaveProperty('no_proxy');
+  });
+
+  it('stays empty unless the hidden remote Codex proxy override is set', () => {
+    expect(getRemoteCodexDaemonProxyEnv({ HTTP_PROXY: 'http://127.0.0.1:7890' } as NodeJS.ProcessEnv)).toEqual({});
   });
 });
 
@@ -400,5 +462,41 @@ describe('ensureRemoteCodexMcpBridge live-turn defer', () => {
     expect(execCmds.join('\n')).not.toContain('test-persistent-token');
     // bootstrap 的 stdin 是 KEY=value + 空行终止。
     expect(inputs).toContain('LIZI_MCP_TOKEN=test-persistent-token\n\n');
+  });
+
+  it('passes remote Codex proxy env to daemon bootstrap via stdin, never argv', async () => {
+    const execCmds: string[] = [];
+    const inputs: string[] = [];
+    process.env.CINDY_REMOTE_CODEX_PROXY_URL = 'http://127.0.0.1:7890';
+    const host = {
+      id: 'host-stdin-proxy',
+      exec: async (cmd: string, opts?: { input?: string }) => {
+        execCmds.push(cmd);
+        if (opts?.input) inputs.push(opts.input);
+        if (cmd.includes('cat "$CODEX_HOME/config.toml"')) {
+          return { exitCode: 0, stdout: '', stderr: '' };
+        }
+        return { exitCode: 0, stdout: 'ok', stderr: '' };
+      },
+      openRemoteForward: async (spec: { id: string; remotePort: number }) => ({
+        id: spec.id,
+        remotePort: spec.remotePort,
+        localHost: '127.0.0.1',
+        localPort: 38080,
+        bound: true,
+      }),
+    } as unknown as RemoteHost;
+
+    const result = await ensureRemoteCodexMcpBridge(host, {
+      ...bridgeDeps,
+      hasLiveTurnOnHost: () => false,
+    });
+    expect(result.ok).toBe(true);
+    const joinedCmds = execCmds.join('\n');
+    const joinedInputs = inputs.join('\n');
+    expect(joinedCmds).not.toContain('127.0.0.1:7890');
+    expect(joinedInputs).toContain('HTTP_PROXY=http://127.0.0.1:7890');
+    expect(joinedInputs).toContain('HTTPS_PROXY=http://127.0.0.1:7890');
+    expect(joinedInputs).toContain('NO_PROXY=127.0.0.1,localhost,::1');
   });
 });

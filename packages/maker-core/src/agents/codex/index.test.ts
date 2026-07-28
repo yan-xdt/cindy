@@ -3550,6 +3550,50 @@ describe('CodexAgent MCP thread context hooks', () => {
     await handle.close();
   });
 
+  it('keeps auto-review enabled for supported remote Codex daemons', async () => {
+    const agent = new CodexAgent(createDeps());
+    const host = installFakeHost(agent, (method) => {
+      if (method === Method.TurnStart) {
+        return { turn: { id: 'turn-remote-auto-approval-policy' } };
+      }
+      return undefined;
+    }, { userAgent: 'cindy/0.145.0 (Ubuntu 22.4.0; x86_64)' });
+
+    const handle = await agent.startSession({
+      sessionId: 'session-remote-auto-approval-policy',
+      model: 'gpt-5.5',
+      providerId: 'openai',
+      workingDir: '/repo',
+      remoteHostId: 'remote-host-1',
+      permissionMode: 'auto',
+    });
+
+    const startParams = host.request.mock.calls.find(([method]) => method === Method.ThreadStart)?.[1] as {
+      approvalPolicy?: string;
+      approvalsReviewer?: string;
+      sandbox?: string;
+    };
+    expect(startParams).toMatchObject({
+      approvalPolicy: 'on-request',
+      approvalsReviewer: 'auto_review',
+      sandbox: 'workspace-write',
+    });
+
+    await handle.send({ type: 'user', content: 'hello' });
+    const turnParams = host.request.mock.calls.find(([method]) => method === Method.TurnStart)?.[1] as {
+      approvalPolicy?: string;
+      approvalsReviewer?: string;
+      sandboxPolicy?: { type?: string };
+    };
+    expect(turnParams).toMatchObject({
+      approvalPolicy: 'on-request',
+      approvalsReviewer: 'auto_review',
+      sandboxPolicy: { type: 'workspaceWrite' },
+    });
+
+    await handle.close();
+  });
+
   it('falls back to untrusted approvals on XD and interrupts the active turn when tightened to Ask', async () => {
     const agent = new CodexAgent(createDeps());
     const host = installFakeHost(agent, (method) => {

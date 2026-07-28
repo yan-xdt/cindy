@@ -33,6 +33,7 @@ import type { RemoteHost } from '@cindy/maker-remote-ssh';
 
 import { createLogger } from '../logger.js';
 import { getRemoteMcpBridgeToken } from '../mcp-integrations/remoteMcpBridgeToken.js';
+import { serializeEnvBlock } from './env-block.js';
 
 const log = createLogger('codex-remote-mcp');
 
@@ -45,11 +46,18 @@ const MANAGED_END = '# <<< cindy-remote-mcp <<<';
  * 判定必须认识它, 否则该行被当成用户内容剥出受管段, 幂等漂移检测失效。
  */
 const TOKEN_FINGERPRINT_PREFIX = '# cindy-token-fingerprint:';
+const PROXY_FINGERPRINT_PREFIX = '# cindy-proxy-fingerprint:';
 /** per-host 固定远端端口的起始探测值与探测上限。 */
 const DEFAULT_REMOTE_PORT_START = 47921;
 const MAX_PORT_ATTEMPTS = 20;
 /** 与 codex-remote-transport.ts 的 installRoot 默认值一致。 */
 const DEFAULT_INSTALL_ROOT = '$HOME/.xdt-server/v1';
+const REMOTE_CODEX_PROXY_URL_ENV = 'CINDY_REMOTE_CODEX_PROXY_URL';
+const REMOTE_CODEX_HTTP_PROXY_ENV = 'CINDY_REMOTE_CODEX_HTTP_PROXY';
+const REMOTE_CODEX_HTTPS_PROXY_ENV = 'CINDY_REMOTE_CODEX_HTTPS_PROXY';
+const REMOTE_CODEX_ALL_PROXY_ENV = 'CINDY_REMOTE_CODEX_ALL_PROXY';
+const REMOTE_CODEX_NO_PROXY_ENV = 'CINDY_REMOTE_CODEX_NO_PROXY';
+const LOCALHOST_NO_PROXY = ['127.0.0.1', 'localhost', '::1'];
 
 /** 远端 MCP 注入所需的 bridge 信息(由调用方确保 bridge 已启动后提供)。 */
 export interface RemoteMcpBridgeEndpoint {
@@ -62,6 +70,60 @@ export interface EnsureRemoteCodexMcpResult {
   ok: boolean;
   /** 失败原因 (bridge-unavailable / token-unavailable / forward-failed / ...)。 */
   reason?: string;
+}
+
+function nonEmptyEnv(env: NodeJS.ProcessEnv, key: string): string | null {
+  const v = env[key];
+  if (typeof v !== 'string') return null;
+  const trimmed = v.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function mergeNoProxy(value: string | null): string {
+  const existing = value
+    ? value.split(',').map((part) => part.trim()).filter(Boolean)
+    : [];
+  return Array.from(new Set([...existing, ...LOCALHOST_NO_PROXY])).join(',');
+}
+
+/**
+ * Hidden dev/ops override for remote Codex daemon outbound networking.
+ *
+ * Cindy cannot ship the local loopback Codex proxy to an SSH host. Operators
+ * who provide their own remote-visible proxy should start Cindy with:
+ *   CINDY_REMOTE_CODEX_PROXY_URL=http://127.0.0.1:7890
+ * or the per-scheme variants below. Values are ferried to daemon bootstrap via
+ * stdin only, because proxy URLs may contain credentials.
+ */
+export function getRemoteCodexDaemonProxyEnv(env: NodeJS.ProcessEnv = process.env): Record<string, string> {
+  const sharedProxy = nonEmptyEnv(env, REMOTE_CODEX_PROXY_URL_ENV);
+  const httpProxy = nonEmptyEnv(env, REMOTE_CODEX_HTTP_PROXY_ENV) ?? sharedProxy;
+  const httpsProxy = nonEmptyEnv(env, REMOTE_CODEX_HTTPS_PROXY_ENV) ?? sharedProxy;
+  const allProxy = nonEmptyEnv(env, REMOTE_CODEX_ALL_PROXY_ENV);
+  if (!httpProxy && !httpsProxy && !allProxy) return {};
+
+  const out: Record<string, string> = {};
+  if (httpProxy) {
+    out.HTTP_PROXY = httpProxy;
+  }
+  if (httpsProxy) {
+    out.HTTPS_PROXY = httpsProxy;
+  }
+  if (allProxy) {
+    out.ALL_PROXY = allProxy;
+  }
+  const noProxy = mergeNoProxy(nonEmptyEnv(env, REMOTE_CODEX_NO_PROXY_ENV));
+  out.NO_PROXY = noProxy;
+  return out;
+}
+
+function envFingerprint(env: Record<string, string>): string | null {
+  const entries = Object.entries(env).sort(([a], [b]) => a.localeCompare(b));
+  if (entries.length === 0) return null;
+  return createHash('sha256')
+    .update(entries.map(([k, v]) => `${k}=${v}`).join('\0'), 'utf8')
+    .digest('hex')
+    .slice(0, 12);
 }
 
 // ── per-host 固定 remotePort 持久化 ─────────────────────────────────────────
@@ -140,8 +202,16 @@ export function renderManagedMcpBlock(opts: {
    * env 里的旧 token 不失效, config 无漂移不重启, 远端请求全部 401。
    */
   tokenFingerprint: string;
+  /**
+   * 当前远端 Codex daemon proxy env 指纹。proxy env 只经 bootstrap stdin 注入,
+   * 不落 config.toml；指纹写入受管段用于让代理变更触发 daemon 重启。
+   */
+  proxyFingerprint?: string | null;
 }): string {
   const lines: string[] = [MANAGED_BEGIN, `${TOKEN_FINGERPRINT_PREFIX} ${opts.tokenFingerprint}`];
+  if (opts.proxyFingerprint) {
+    lines.push(`${PROXY_FINGERPRINT_PREFIX} ${opts.proxyFingerprint}`);
+  }
   for (const name of opts.serverNames) {
     lines.push(
       `[mcp_servers.${name}]`,
@@ -279,7 +349,13 @@ function codexDaemonCmd(subArgs: string[], opts?: { envFromStdin?: boolean }): s
     // secret 不进 argv (远端 `ps` 可见):经 stdin 的 KEY=value 块传入, 空行
     // 终止, 与 remote-ssh/index.ts oneShotCommand 的 stdin 协议一致。
     ...(opts?.envFromStdin
-      ? ['while IFS= read -r LINE; do [ -z "$LINE" ] && break; export "$LINE"; done']
+      ? [
+          'while IFS= read -r LINE; do [ -z "$LINE" ] && break; export "$LINE"; done',
+          '[ -n "${HTTP_PROXY+x}" ] && export http_proxy="$HTTP_PROXY"',
+          '[ -n "${HTTPS_PROXY+x}" ] && export https_proxy="$HTTPS_PROXY"',
+          '[ -n "${ALL_PROXY+x}" ] && export all_proxy="$ALL_PROXY"',
+          '[ -n "${NO_PROXY+x}" ] && export no_proxy="$NO_PROXY"',
+        ]
       : []),
     `exec "$CODEX" ${subArgs.map(shellQuoteSh).join(' ')}`,
   ].join('\n');
@@ -331,7 +407,15 @@ async function isDaemonRunning(host: RemoteHost): Promise<boolean> {
  * live in stdin" 一致), cmd 不进日志 (RemoteHost.exec 的 label 约定),
  * 不落远端文件。
  */
-async function bootstrapDaemon(host: RemoteHost, token: string): Promise<void> {
+async function bootstrapDaemon(
+  host: RemoteHost,
+  token: string,
+  extraEnv: Record<string, string> = {},
+): Promise<void> {
+  const envBlock = serializeEnvBlock({
+    [TOKEN_ENV]: token,
+    ...extraEnv,
+  });
   const result = await host.exec(
     codexDaemonCmd(['app-server', 'daemon', 'bootstrap', '--remote-control'], {
       envFromStdin: true,
@@ -341,7 +425,7 @@ async function bootstrapDaemon(host: RemoteHost, token: string): Promise<void> {
       label: 'codex-daemon-bootstrap',
       // KEY=value 行 + 空行终止符 (wrapper 的 read 循环消费; token 是 hex,
       // 无换行/空格, 单行安全)。read 循环后 stdin 即 EOF, daemon 不读 stdin。
-      input: `${TOKEN_ENV}=${token}\n\n`,
+      input: `${envBlock}\n\n`,
     },
   );
   if (result.exitCode !== 0) {
@@ -485,11 +569,14 @@ async function doEnsureRemoteCodexMcpBridge(
     const remotePort = await ensureRemotePort(host, bridge.port);
 
     const tokenFingerprint = createHash('sha256').update(token, 'utf8').digest('hex').slice(0, 12);
+    const daemonProxyEnv = getRemoteCodexDaemonProxyEnv();
+    const proxyFingerprint = envFingerprint(daemonProxyEnv);
     const existing = await readRemoteConfig(host);
     const block = renderManagedMcpBlock({
       remotePort,
       serverNames: bridge.serverNames,
       tokenFingerprint,
+      proxyFingerprint,
     });
     const { next, changed, strippedUserServers } = mergeManagedMcpBlock(existing, block, {
       serverNames: bridge.serverNames,
@@ -519,14 +606,14 @@ async function doEnsureRemoteCodexMcpBridge(
 
     const daemonRunning = await isDaemonRunning(host);
     if (!daemonRunning || changed) {
-      await bootstrapDaemon(host, token);
+      await bootstrapDaemon(host, token, daemonProxyEnv);
       // 防御:bootstrap 若覆盖了 config.toml (managed_install 行为未文档化),
       // 管理段丢失时补写一次并再次 bootstrap。最多两轮,避免无限循环。
       const after = await readRemoteConfig(host);
       if (!after.includes(MANAGED_BEGIN)) {
         log.warn('managed mcp block lost after bootstrap — rewriting once', { host: host.id });
         await writeRemoteConfig(host, next);
-        await bootstrapDaemon(host, token);
+        await bootstrapDaemon(host, token, daemonProxyEnv);
       }
       log.info('remote codex daemon (re)bootstrapped with MCP bridge env', {
         host: host.id,

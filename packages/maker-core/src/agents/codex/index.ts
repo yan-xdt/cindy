@@ -2107,12 +2107,13 @@ export class CodexAgent extends BaseAgent {
     const approvalsReviewerProtocolSupported =
       supportsCodexApprovalsReviewerProtocol(initResp.userAgent);
     // Codex's built-in reviewer currently selects the hidden `codex-auto-review`
-    // model through the session's model provider. Cindy's gateway, third-party
-    // providers, and remote daemons do not have a verified route for that model.
-    // Keep Auto usable on those routes by falling back to Codex's native
-    // `untrusted` policy instead of letting the first write fail in the reviewer.
+    // model through the session's model provider. Local Cindy gateway and
+    // third-party provider routes are not verified for that model, so they fall
+    // back to Codex's native `untrusted` policy. SSH remote daemons own their
+    // provider/auth route on the remote host and supported Auto before the route
+    // gate was tightened, so allow them when the app-server protocol supports it.
     const approvalsReviewerRouteSupported =
-      !opts.remoteHostId && sessionCredentialMode === 'oauth-bearer';
+      opts.remoteHostId ? true : sessionCredentialMode === 'oauth-bearer';
     const approvalsReviewerSupported =
       approvalsReviewerProtocolSupported && approvalsReviewerRouteSupported;
     const readonlyReferenceDirsSupported = supportsCodexReadonlyReferenceDirs(initResp.userAgent);
